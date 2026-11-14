@@ -461,17 +461,17 @@ $suspiciousPatterns = @(
     "ShieldBreaker", "TriggerBot", "AxeSpam", "WebMacro",
     "FastPlace", "WalskyOptimizer", "WalksyOptimizer", "walsky.optimizer",
     "WalksyCrystalOptimizerMod", "Donut", "Replace Mod",
-    "ShieldDisabler", "SilentAim", "Totem Hit", "Wtap", "FakeLag", "dev.virel", "orchard" 
+    "ShieldDisabler", "SilentAim", "Totem Hit", "Wtap", "FakeLag", "dev.virel", "orchard",
     "BlockESP", "dev.krypton", "dev/krypton", "skid.krypton", "skid/krypton",  "AntiMissClick",
     "LagReach", "PopSwitch", "SprintReset", "ChestSteal", "AntiBot",
     "ElytraSwap", "FastXP", "FastExp", "Refill",  "AirAnchor",
     "jnativehook", "FakeInv", "HoverTotem", "AutoClicker", "AutoFirework",
-    "PackSpoof", "Antiknockback", "catlean", 
+    "PackSpoof", "Antiknockback", "catlean",
     "AuthBypass", "Asteria", "Prestige", "AutoEat", "AutoMine",
     "MaceSwap",  "Macro198", "StunSlam", "SafeAnchor", "DoubleAnchor", "AutoTPA", "BaseFinder", "Xenon", "gypsy",
     "AutoPotRefill", "WalksyOptimizer", "KeyPearl", "AimAssist", "AutoNethPot", "AutoDtap",
     "TriggerBot", "AutoWeb", "AnchorAction",
-    
+
     "org.chainlibs.module.impl.modules.Crystal.Y",
     "org.chainlibs.module.impl.modules.Crystal.bF",
     "org.chainlibs.module.impl.modules.Crystal.bM",
@@ -498,12 +498,12 @@ $suspiciousPatterns = @(
 
 $cheatStrings = @(
     "AutoCrystal", "autocrystal", "auto crystal", "cw crystal", "JDWP.VirtualMachine.AllModules",
-    "dontPlaceCrystal", "dontBreakCrystal", "dev.virel", "orchard" 
+    "dontPlaceCrystal", "dontBreakCrystal", "dev.virel", "orchard",
     "AutoHitCrystal", "autohitcrystal", "canPlaceCrystalServer", "healPotSlot",
     "ＡｕｔｏＣｒｙｓｔａｌ", "Ａｕｔｏ Ｃｒｙｓｔａｌ",
     "ＡｕｔｏＨｉｔＣｒｙｓｔａｌ",
     "AutoAnchor", "autoanchor", "auto anchor", "DoubleAnchor",
-     "HasAnchor", "anchortweaks", "anchor macro", "safe anchor", "safeanchor",
+    "HasAnchor", "anchortweaks", "anchor macro", "safe anchor", "safeanchor",
     "SafeAnchor", "AirAnchor",
     "ＡｕｔｏＡｎｃｈｏｒ", "Ａｕｔｏ Ａｎｃｈｏｒ",
     "ＤｏｕｂｌｅＡｎｃｈｏｒ", "Ｄｏｕｂｌｅ Ａｎｃｈｏｒ",
@@ -535,7 +535,7 @@ $cheatStrings = @(
     "Ｓｐｅａｒ Ｓｗａｐ", "Ａｕｔｏｍａｔｉｃａｌｌｙ ａｘｅ ａｎｄ ｍａｃｅ ｓｈｉｅｌｄｅｄ ｐｌａｙｅｒｓ",
     "Ｓｔｕｎ Ｓｌａｍ", "StunSlam",
     "Donut", "JumpReset", "axespam", "axe spam",
-    
+
     "findKnockbackSword", "attackRegisteredThisClick",
     "AimAssist", "aimassist", "aim assist",
     "triggerbot", "trigger bot",
