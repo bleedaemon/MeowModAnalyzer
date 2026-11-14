@@ -1770,6 +1770,34 @@ bypassFiles=(); bypassFlags=(); bypassPaths=()
 obfFiles=(); obfFlags=(); obfPaths=()
 jvmFlags=()
 
+# ---------------------------------------------------------------------------
+# SHA-1 duplicate merging (whole-system / launcher scans only)
+# ---------------------------------------------------------------------------
+dedupeHashes=false
+case "$scanMode" in
+    system|launchers) dedupeHashes=true ;;
+esac
+dupRoot="$TMPROOT/dupes"
+hashSeenDir="$TMPROOT/hashseen"
+dupCount=0
+primaryJars=()
+if [ "$dedupeHashes" = true ]; then
+    mkdir -p "$dupRoot" "$hashSeenDir" 2>/dev/null || true
+fi
+
+path_key() {
+    printf '%s' "$1" | cksum 2>/dev/null | awk '{print $1 "-" $2}'
+}
+
+# Print paths of files that were merged into $1 (identical SHA-1).
+mod_extra_paths() {
+    local f
+    [ "$dedupeHashes" = true ] || return 0
+    f="$dupRoot/$(path_key "$1")"
+    [ -f "$f" ] && cat "$f" 2>/dev/null
+    return 0
+}
+
 # Full path for a result entry. In whole-system/launcher scans the analyzed
 # path is shown; archive members show "<archive> → <member>" instead of the
 # temporary extraction path.
@@ -2158,11 +2186,15 @@ jvm_scan() {
 # Rendering helpers
 # ---------------------------------------------------------------------------
 write_suspicious_card() {
-    local file=$1 patterns=$2 strings=$3 fullwidth=$4 line
+    local file=$1 patterns=$2 strings=$3 fullwidth=$4 path=$5 line extra
 
     printf '%s  %s%s\n' "$C_DARKRED" "$(repeat_char "─" 70)" "$C_RESET"
     printf '%s  │ %s%s FLAGGED %s  %s%s%s\n' \
         "$C_DARKRED" "$C_RESET" "${C_WHITE}${C_BG_DARKRED}" "$C_RESET" "$C_YELLOW" "$file" "$C_RESET"
+    while IFS= read -r extra; do
+        [ -n "$extra" ] || continue
+        printf '%s  │    %s↳ %s%s\n' "$C_DARKRED" "$C_DARKGRAY" "$(full_mod_path "$extra")" "$C_RESET"
+    done <<< "$(mod_extra_paths "$path")"
     printf '%s  │ %s%s\n' "$C_DARKRED" "$(repeat_char "─" 66)" "$C_RESET"
 
     if [ -n "$patterns" ]; then
@@ -2196,11 +2228,15 @@ write_suspicious_card() {
     printf '%s  %s%s\n\n' "$C_DARKRED" "$(repeat_char "─" 70)" "$C_RESET"
 }
 
-write_flag_card() { # file flags badge bullet bgcolor
-    local file=$1 flags=$2 badge=$3 bullet=$4 bg=$5 line title desc
+write_flag_card() { # file flags badge bullet bgcolor path
+    local file=$1 flags=$2 badge=$3 bullet=$4 bg=$5 path=$6 line title desc extra
     printf '%s  %s%s\n' "$C_DARKMAGENTA" "$(repeat_char "─" 70)" "$C_RESET"
     printf '%s  │ %s%s %s %s  %s%s%s\n' \
         "$C_DARKMAGENTA" "$C_RESET" "${C_WHITE}${bg}" "$badge" "$C_RESET" "$C_YELLOW" "$file" "$C_RESET"
+    while IFS= read -r extra; do
+        [ -n "$extra" ] || continue
+        printf '%s  │    %s↳ %s%s\n' "$C_DARKMAGENTA" "$C_DARKGRAY" "$(full_mod_path "$extra")" "$C_RESET"
+    done <<< "$(mod_extra_paths "$path")"
     printf '%s  │ %s%s\n' "$C_DARKMAGENTA" "$(repeat_char "─" 66)" "$C_RESET"
 
     while IFS= read -r line; do
@@ -2241,6 +2277,19 @@ for jar in "${jarFiles[@]}"; do
     printf '\r%s[%s] Verifying: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
 
     hash=$(file_sha1 "$jar")
+    if [ "$dedupeHashes" = true ] && [ -n "$hash" ]; then
+        if [ -f "$hashSeenDir/$hash" ]; then
+            primary=$(cat "$hashSeenDir/$hash" 2>/dev/null)
+            if [ -n "$primary" ]; then
+                printf '%s\n' "$jar" >> "$dupRoot/$(path_key "$primary")"
+                dupCount=$((dupCount + 1))
+                continue
+            fi
+        else
+            printf '%s' "$jar" > "$hashSeenDir/$hash"
+        fi
+    fi
+    primaryJars+=("$jar")
     if [ -n "$hash" ]; then
         modrinthRes=$(query_modrinth "$hash")
         mName=${modrinthRes%%|*}
@@ -2275,6 +2324,16 @@ for jar in "${jarFiles[@]}"; do
     unknownPaths+=("$jar")
 done
 printf '\r%*s\r' 100 ''
+
+if [ "$dedupeHashes" = true ]; then
+    jarFiles=("${primaryJars[@]}")
+    totalFiles=${#jarFiles[@]}
+    if [ "$dupCount" -gt 0 ]; then
+        dupWord="duplicates"
+        [ "$dupCount" -eq 1 ] && dupWord="duplicate"
+        printf '%s   ↺ Merged %s %s with identical SHA-1%s\n' "$C_DARKGRAY" "$dupCount" "$dupWord" "$C_RESET"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # PASS 2 — deep scan
@@ -2394,6 +2453,10 @@ if [ ${#verifiedFiles[@]} -gt 0 ]; then
         printf '  %s✓ %s%s%s%s → %s%s%s\n' \
             "$C_GREEN" "${C_RESET}${C_WHITE}" "${verifiedNames[i]}" "$C_RESET" \
             "$C_GRAY" "$C_DARKGRAY" "$(result_label "${verifiedFiles[i]}" "${verifiedPaths[i]}")" "$C_RESET"
+        while IFS= read -r extra; do
+            [ -n "$extra" ] || continue
+            printf '               %s↳ %s%s\n' "$C_DARKGRAY" "$(full_mod_path "$extra")" "$C_RESET"
+        done <<< "$(mod_extra_paths "${verifiedPaths[i]}")"
     done
     printf '\n'
 fi
@@ -2422,6 +2485,10 @@ if [ ${#unknownFiles[@]} -gt 0 ]; then
         case "$scanMode" in
             system|launchers)
                 printf '  %s↳ %s%s\n' "$C_DARKGRAY" "$(result_label "${unknownFiles[i]}" "${unknownPaths[i]}")" "$C_RESET"
+                while IFS= read -r extra; do
+                    [ -n "$extra" ] || continue
+                    printf '  %s↳ %s%s\n' "$C_DARKGRAY" "$(full_mod_path "$extra")" "$C_RESET"
+                done <<< "$(mod_extra_paths "${unknownPaths[i]}")"
                 ;;
         esac
         printf '\n'
@@ -2436,7 +2503,7 @@ if [ ${#suspFiles[@]} -gt 0 ]; then
     write_rule "─" 76 "$C_DARKGRAY"
     printf '\n'
     for ((i = 0; i < ${#suspFiles[@]}; i++)); do
-        write_suspicious_card "$(result_label "${suspFiles[i]}" "${suspPaths[i]}")" "${suspPatterns[i]}" "${suspStrings[i]}" "${suspFullwidth[i]}"
+        write_suspicious_card "$(result_label "${suspFiles[i]}" "${suspPaths[i]}")" "${suspPatterns[i]}" "${suspStrings[i]}" "${suspFullwidth[i]}" "${suspPaths[i]}"
     done
 fi
 
@@ -2448,7 +2515,7 @@ if [ ${#bypassFiles[@]} -gt 0 ]; then
     write_rule "─" 76 "$C_DARKGRAY"
     printf '\n'
     for ((i = 0; i < ${#bypassFiles[@]}; i++)); do
-        write_flag_card "$(result_label "${bypassFiles[i]}" "${bypassPaths[i]}")" "${bypassFlags[i]}" "INJECTION" "◉" "$C_BG_DARKMAGENTA"
+        write_flag_card "$(result_label "${bypassFiles[i]}" "${bypassPaths[i]}")" "${bypassFlags[i]}" "INJECTION" "◉" "$C_BG_DARKMAGENTA" "${bypassPaths[i]}"
     done
 fi
 
@@ -2466,6 +2533,10 @@ if [ ${#obfFiles[@]} -gt 0 ]; then
         printf '%s  %s%s\n' "$C_DARKYELLOW" "$(repeat_char "─" 70)" "$C_RESET"
         printf '%s  │ %s%s OBFUSCATED %s  %s%s%s\n' \
             "$C_DARKYELLOW" "$C_RESET" "${C_BLACK}${C_BG_DARKYELLOW}" "$C_RESET" "$C_YELLOW" "$file" "$C_RESET"
+        while IFS= read -r extra; do
+            [ -n "$extra" ] || continue
+            printf '%s  │    %s↳ %s%s\n' "$C_DARKYELLOW" "$C_DARKGRAY" "$(full_mod_path "$extra")" "$C_RESET"
+        done <<< "$(mod_extra_paths "${obfPaths[i]}")"
         printf '%s  │ %s%s\n' "$C_DARKYELLOW" "$(repeat_char "─" 66)" "$C_RESET"
         while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -2532,6 +2603,14 @@ fi
 # ---------------------------------------------------------------------------
 # Results file
 # ---------------------------------------------------------------------------
+write_txt_extra_paths() { # path
+    local extra
+    while IFS= read -r extra; do
+        [ -n "$extra" ] || continue
+        printf '  ↳ %s\n' "$(full_mod_path "$extra")"
+    done <<< "$(mod_extra_paths "$1")"
+}
+
 write_results_file() {
     local outdir outfile line i
     outdir="${HOME:-.}/ss"
@@ -2549,6 +2628,9 @@ write_results_file() {
         printf 'Scanned: %s\n' "$scanWhere"
         printf '\nSUMMARY\n-------\n'
         printf 'Total files scanned: %s\n' "$totalFiles"
+        if [ "$dupCount" -gt 0 ]; then
+            printf 'Duplicates merged:   %s\n' "$dupCount"
+        fi
         printf 'Verified mods:       %s\n' "${#verifiedFiles[@]}"
         printf 'Unknown mods:        %s\n' "${#unknownFiles[@]}"
         printf 'Suspicious mods:     %s\n' "${#suspFiles[@]}"
@@ -2560,6 +2642,7 @@ write_results_file() {
             printf '\nVERIFIED MODS\n-------------\n'
             for ((i = 0; i < ${#verifiedFiles[@]}; i++)); do
                 printf '✓ %s → %s\n' "${verifiedNames[i]}" "$(full_mod_path "${verifiedPaths[i]}")"
+                write_txt_extra_paths "${verifiedPaths[i]}"
             done
         fi
 
@@ -2567,6 +2650,7 @@ write_results_file() {
             printf '\nUNKNOWN MODS\n------------\n'
             for ((i = 0; i < ${#unknownFiles[@]}; i++)); do
                 printf '? %s\n' "$(full_mod_path "${unknownPaths[i]}")"
+                write_txt_extra_paths "${unknownPaths[i]}"
                 printf '  Source: %s\n' "${unknownSources[i]:-?}"
             done
         fi
@@ -2575,6 +2659,7 @@ write_results_file() {
             printf '\nSUSPICIOUS MODS\n---------------\n'
             for ((i = 0; i < ${#suspFiles[@]}; i++)); do
                 printf '! %s\n' "$(full_mod_path "${suspPaths[i]}")"
+                write_txt_extra_paths "${suspPaths[i]}"
                 if [ -n "${suspPatterns[i]}" ]; then
                     printf '  Patterns:\n'
                     while IFS= read -r line; do
@@ -2600,6 +2685,7 @@ write_results_file() {
             printf '\nBYPASS / INJECTION DETECTED\n---------------------------\n'
             for ((i = 0; i < ${#bypassFiles[@]}; i++)); do
                 printf '! %s\n' "$(full_mod_path "${bypassPaths[i]}")"
+                write_txt_extra_paths "${bypassPaths[i]}"
                 while IFS= read -r line; do
                     [ -n "$line" ] && printf '    %s\n' "$line"
                 done <<< "${bypassFlags[i]}"
@@ -2610,6 +2696,7 @@ write_results_file() {
             printf '\nOBFUSCATED MODS\n---------------\n'
             for ((i = 0; i < ${#obfFiles[@]}; i++)); do
                 printf '! %s\n' "$(full_mod_path "${obfPaths[i]}")"
+                write_txt_extra_paths "${obfPaths[i]}"
                 while IFS= read -r line; do
                     [ -n "$line" ] && printf '    %s\n' "$line"
                 done <<< "${obfFlags[i]}"
@@ -2636,6 +2723,9 @@ write_results_file() {
 printf '%s📊 SUMMARY%s\n' "$C_CYAN" "$C_RESET"
 write_rule "━" 76 "$C_BLUE"
 printf '%s  Total files scanned: %s%s%s\n' "$C_GRAY" "$C_WHITE" "$totalFiles" "$C_RESET"
+if [ "$dedupeHashes" = true ] && [ "$dupCount" -gt 0 ]; then
+    printf '%s  Duplicates merged:   %s%s%s\n' "$C_GRAY" "$C_WHITE" "$dupCount" "$C_RESET"
+fi
 printf '%s  Verified mods:       %s%s%s\n' "$C_GRAY" "$C_GREEN" "${#verifiedFiles[@]}" "$C_RESET"
 printf '%s  Unknown mods:        %s%s%s\n' "$C_GRAY" "$C_YELLOW" "${#unknownFiles[@]}" "$C_RESET"
 printf '%s  Suspicious mods:     %s%s%s\n' "$C_GRAY" "$C_RED" "${#suspFiles[@]}" "$C_RESET"

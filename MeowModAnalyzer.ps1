@@ -57,6 +57,10 @@ $script:SkipDirNames = @(
 $script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
 $script:JarOrigin = @{}
+$script:HashPrimary = @{}
+$script:PathDupes = @{}
+$script:DuplicateJars = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$script:DuplicateCount = 0
 
 function Remove-ArchiveTemp {
     if ($script:ArchiveTemp -and (Test-Path -LiteralPath $script:ArchiveTemp)) {
@@ -158,6 +162,31 @@ function Get-ModDisplay {
         return (Get-FullDisplay -Path $Path -Name $Name)
     }
     return $Name
+}
+
+function Get-ExtraPaths {
+    param([string]$Path)
+    if (-not $Path) { return @() }
+    if ($script:PathDupes.ContainsKey($Path)) { return $script:PathDupes[$Path] }
+    return @()
+}
+
+function Get-FullDisplayForPath {
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    return (Get-FullDisplay -Path $Path -Name ([System.IO.Path]::GetFileName($Path)))
+}
+
+function Write-ExtraPaths {
+    param(
+        [string]$Path,
+        [string]$Prefix = '  │    ',
+        [ConsoleColor]$Color = 'DarkGray'
+    )
+    foreach ($extra in (Get-ExtraPaths -Path $Path)) {
+        Write-Host ($Prefix + "↳ ") -ForegroundColor $Color -NoNewline
+        Write-Host (Get-FullDisplayForPath -Path $extra) -ForegroundColor $Color
+    }
 }
 
 function Get-ModsDirJars {
@@ -1268,6 +1297,7 @@ function Write-SuspiciousCard {
     Write-Host " FLAGGED " -ForegroundColor White -BackgroundColor DarkRed -NoNewline
     Write-Host "  " -NoNewline
     Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
+    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkRed
 
     if ($Mod.Patterns.Count -gt 0) {
@@ -1314,6 +1344,7 @@ function Write-InjectionCard {
     Write-Host " INJECTION " -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline
     Write-Host "  " -NoNewline
     Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
+    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkMagenta
 
     foreach ($flag in $Mod.Flags) {
@@ -1349,6 +1380,7 @@ function Write-ObfuscationCard {
     Write-Host " OBFUSCATED " -ForegroundColor Black -BackgroundColor DarkYellow -NoNewline
     Write-Host "  " -NoNewline
     Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
+    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkYellow
 
     foreach ($flag in $Mod.Flags) {
@@ -1442,6 +1474,23 @@ foreach ($jar in $jarFiles) {
 
     $hash = Get-FileSHA1 -Path $jar.FullName
 
+    if ($hash -and ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers')) {
+        if ($script:HashPrimary.ContainsKey($hash)) {
+            $primary = $script:HashPrimary[$hash]
+            if ($primary -ne $jar.FullName) {
+                if (-not $script:PathDupes.ContainsKey($primary)) {
+                    $script:PathDupes[$primary] = New-Object System.Collections.Generic.List[string]
+                }
+                [void]$script:PathDupes[$primary].Add($jar.FullName)
+                [void]$script:DuplicateJars.Add($jar.FullName)
+                $script:DuplicateCount++
+                continue
+            }
+        } else {
+            $script:HashPrimary[$hash] = $jar.FullName
+        }
+    }
+
     if ($hash) {
         $modrinthData = Query-Modrinth -Hash $hash
         if ($modrinthData.Slug) {
@@ -1474,6 +1523,13 @@ foreach ($jar in $jarFiles) {
 }
 
 Write-Host "`r$(' ' * 100)`r" -NoNewline
+
+if ($script:DuplicateJars.Count -gt 0) {
+    $jarFiles = @($jarFiles | Where-Object { -not $script:DuplicateJars.Contains($_.FullName) })
+    $totalFiles = $jarFiles.Count
+    $dupWord = if ($script:DuplicateCount -eq 1) { 'duplicate' } else { 'duplicates' }
+    Write-Host "   ↺ Merged $($script:DuplicateCount) $dupWord with identical SHA-1" -ForegroundColor DarkGray
+}
 
 $modWord = if ($totalFiles -eq 1) { "mod" } else { "mods" }
 Write-Host "🔬 Pass 2 — Deep-scanning all $totalFiles $modWord..." -ForegroundColor Cyan
@@ -1580,6 +1636,7 @@ if ($verifiedMods.Count -gt 0) {
         Write-Host "$($mod.ModName)" -ForegroundColor White -NoNewline
         Write-Host " → " -ForegroundColor Gray -NoNewline
         Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
+        Write-ExtraPaths -Path $mod.FilePath -Prefix '               ' -Color DarkGray
     }
     Write-Host ""
 }
@@ -1598,6 +1655,7 @@ if ($unknownMods.Count -gt 0) {
         if ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers') {
             Write-Host "  ↳ " -ForegroundColor DarkGray -NoNewline
             Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
+            Write-ExtraPaths -Path $mod.FilePath -Prefix '  ' -Color DarkGray
         }
         Write-Host ""
     }
@@ -1665,6 +1723,13 @@ if ($jvmFlags.Count -gt 0) {
     Write-Host ""
 }
 
+function Add-ResultExtraLines {
+    param($Lines, [string]$Path)
+    foreach ($extra in (Get-ExtraPaths -Path $Path)) {
+        $null = $Lines.Add("  ↳ " + (Get-FullDisplayForPath -Path $extra))
+    }
+}
+
 function Write-ResultsFile {
     $lines = [System.Collections.Generic.List[string]]::new()
     $null = $lines.Add('Meow Mod Analyzer — Results')
@@ -1675,6 +1740,9 @@ function Write-ResultsFile {
     $null = $lines.Add('SUMMARY')
     $null = $lines.Add('-------')
     $null = $lines.Add("Total files scanned: $totalFiles")
+    if ($script:DuplicateJars.Count -gt 0) {
+        $null = $lines.Add("Duplicates merged:   $($script:DuplicateCount)")
+    }
     $null = $lines.Add("Verified mods:       $($verifiedMods.Count)")
     $null = $lines.Add("Unknown mods:        $($unknownMods.Count)")
     $null = $lines.Add("Suspicious mods:     $($suspiciousMods.Count)")
@@ -1688,6 +1756,7 @@ function Write-ResultsFile {
         $null = $lines.Add('-------------')
         foreach ($mod in $verifiedMods) {
             $null = $lines.Add(("✓ {0} → {1}" -f $mod.ModName, (Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)))
+            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
         }
     }
 
@@ -1697,6 +1766,7 @@ function Write-ResultsFile {
         $null = $lines.Add('------------')
         foreach ($mod in $unknownMods) {
             $null = $lines.Add("? $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
             $src = if ($mod.DownloadSource) { $mod.DownloadSource } else { '?' }
             $null = $lines.Add("  Source: $src")
         }
@@ -1708,6 +1778,7 @@ function Write-ResultsFile {
         $null = $lines.Add('---------------')
         foreach ($mod in $suspiciousMods) {
             $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
             if ($mod.Patterns.Count -gt 0) {
                 $null = $lines.Add('  Patterns:')
                 foreach ($p in ($mod.Patterns | Sort-Object)) { $null = $lines.Add("    $p") }
@@ -1730,6 +1801,7 @@ function Write-ResultsFile {
         $null = $lines.Add('---------------------------')
         foreach ($mod in $bypassMods) {
             $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
             foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
         }
     }
@@ -1740,6 +1812,7 @@ function Write-ResultsFile {
         $null = $lines.Add('---------------')
         foreach ($mod in $obfuscatedMods) {
             $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
             foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
         }
     }
