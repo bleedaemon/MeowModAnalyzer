@@ -18,9 +18,10 @@ jobs:
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
-          # Укажите путь к вашим .sh файлам, если они лежат в отдельной папке,
-          # либо оставьте проверку всех файлов в репозитории:
-          check_together: true
+          # Указываем конкретный файл для проверки, чтобы не сканировать лишнее
+          files: "MeowModAnalyzer.sh"
+          # Если нужно игнорировать некритичные ворнинги, можно добавить флаги (опционально)
+          # severity: error
 
   lint-powershell:
     name: Lint PowerShell (.ps1)
@@ -32,25 +33,15 @@ jobs:
       - name: Run PSScriptAnalyzer
         shell: pwsh
         run: |
-          # Устанавливаем PSScriptAnalyzer, если он еще не установлен
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
               Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
           }
-
-          # Запускаем анализ всех .ps1 файлов в репозитории
           $results = Invoke-ScriptAnalyzer -Path . -Recurse
-
-          # Выводим результаты в лог
           if ($results) {
               $results | Format-Table
-              # Если найдены ошибки (Error), сваливаем билд
               $errors = $results | Where-Object { $_.Severity -eq 'Error' }
               if ($errors) {
                   Write-Error "PSScriptAnalyzer found critical errors."
                   exit 1
-              } else {
-                  Write-Host "PSScriptAnalyzer found warnings/infos, but no critical errors." -ForegroundColor Yellow
               }
-          } else {
-              Write-Host "No PSScriptAnalyzer issues found. Great job!" -ForegroundColor Green
           }
