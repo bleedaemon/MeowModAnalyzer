@@ -15,13 +15,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Check Bash Syntax
+        run: bash -n MeowModAnalyzer.sh
+
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@2.0.0
         with:
-          # Указываем конкретный файл для проверки, чтобы не сканировать лишнее
           files: "MeowModAnalyzer.sh"
-          # Если нужно игнорировать некритичные ворнинги, можно добавить флаги (опционально)
-          # severity: error
+          severity: error
 
   lint-powershell:
     name: Lint PowerShell (.ps1)
