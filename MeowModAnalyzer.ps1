@@ -47,7 +47,7 @@ Write-Host
 # Scan-scope helpers
 # ---------------------------------------------------------------------------
 $script:SkipDirNames = @(
-    '.git','.svn','.hg','node_modules','__pycache__','.cache','.gradle','.m2',
+    '.git','.svn','.hg','node_modules','__pycache__','.cache','.gradle','.m2','loom-cache',
     'proc','sys','dev','run','usr','lib','lib32','lib64','bin','sbin','etc','boot','var','nix','snap',
     'libraries','versions','runtime','jre','jdk','processedMods','assets','natives',
     'System Volume Information','Windows','Program Files','Program Files (x86)',
@@ -56,6 +56,7 @@ $script:SkipDirNames = @(
 
 $script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
+$script:JarOrigin = @{}
 
 function Remove-ArchiveTemp {
     if ($script:ArchiveTemp -and (Test-Path -LiteralPath $script:ArchiveTemp)) {
@@ -116,28 +117,47 @@ function Test-SkipJarPath {
     $p = $Path -replace '/','\'
     $lp = $p.ToLowerInvariant()
     if ($lp -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
-    if ($lp -match '\\(libraries|versions|runtime|jre|jdk|\.gradle|\.m2)\\') { return $true }
+    if ($lp -match '\\(libraries|versions|runtime|jre|jdk|\.gradle|\.m2|loom-cache)\\') { return $true }
 
     $name = [System.IO.Path]::GetFileName($p).ToLowerInvariant()
     foreach ($pat in @('minecraft*.jar','forge-*.jar','neoforge-*.jar','fabric-loader*.jar','quilt-loader*.jar',
                        'authlib*.jar','brigadier*.jar','datafixerupper*.jar','log4j*.jar','netty*.jar','guava*.jar',
                        'gson*.jar','asm-*.jar','jopt-simple*.jar','commons-*.jar','slf4j*.jar','lwjgl*.jar',
-                       'jna*.jar','joml*.jar','oshi*.jar','text2speech*.jar')) {
+                       'jna*.jar','joml*.jar','oshi*.jar','text2speech*.jar',
+                       'gradle-wrapper*.jar','remapped.*.jar','remapped-*.jar')) {
         if ($name -like $pat) { return $true }
     }
     return $false
 }
 
 function Add-JarFile {
-    param([string]$Path)
+    param([string]$Path, [string]$Origin)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
     if (Test-SkipJarPath $Path) { return }
     try { $full = (Resolve-Path -LiteralPath $Path).Path } catch { return }
     if (-not $script:JarSeen.Add($full)) { return }
+    if ($Origin) { $script:JarOrigin[$full] = $Origin }
     [void]$script:JarFiles.Add([PSCustomObject]@{
         FullName = $full
         Name     = [System.IO.Path]::GetFileName($full)
     })
+}
+
+function Get-FullDisplay {
+    param([string]$Path, [string]$Name)
+    if ($Path -and $script:JarOrigin.ContainsKey($Path)) {
+        return ("{0} → {1}" -f $script:JarOrigin[$Path], $Name)
+    }
+    if ($Path) { return $Path }
+    return $Name
+}
+
+function Get-ModDisplay {
+    param([string]$Path, [string]$Name)
+    if ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers') {
+        return (Get-FullDisplay -Path $Path -Name $Name)
+    }
+    return $Name
 }
 
 function Get-ModsDirJars {
@@ -204,7 +224,7 @@ function Get-SystemRoots {
 function Test-SkipArchiveEntry {
     param([string]$Entry)
     $e = ($Entry -replace '/','\').ToLowerInvariant()
-    if ($e -match '(^|\\)(libraries|versions|runtime|jre|jdk)(\\|$)') { return $true }
+    if ($e -match '(^|\\)(libraries|versions|runtime|jre|jdk|loom-cache)(\\|$)') { return $true }
     if ($e -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
     return $false
 }
@@ -262,7 +282,7 @@ function Expand-ArchiveJars {
 
     Get-ChildItem -LiteralPath $dest -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -ieq '.jar' } |
-        ForEach-Object { Add-JarFile $_.FullName }
+        ForEach-Object { Add-JarFile -Path $_.FullName -Origin $Archive }
 }
 
 function Add-SystemJars {
@@ -1247,7 +1267,7 @@ function Write-SuspiciousCard {
     Write-Host "  │ " -ForegroundColor DarkRed -NoNewline
     Write-Host " FLAGGED " -ForegroundColor White -BackgroundColor DarkRed -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host $Mod.FileName -ForegroundColor Yellow
+    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkRed
 
     if ($Mod.Patterns.Count -gt 0) {
@@ -1293,7 +1313,7 @@ function Write-InjectionCard {
     Write-Host "  │ " -ForegroundColor DarkMagenta -NoNewline
     Write-Host " INJECTION " -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host $Mod.FileName -ForegroundColor Yellow
+    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkMagenta
 
     foreach ($flag in $Mod.Flags) {
@@ -1328,7 +1348,7 @@ function Write-ObfuscationCard {
     Write-Host "  │ " -ForegroundColor DarkYellow -NoNewline
     Write-Host " OBFUSCATED " -ForegroundColor Black -BackgroundColor DarkYellow -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host $Mod.FileName -ForegroundColor Yellow
+    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkYellow
 
     foreach ($flag in $Mod.Flags) {
@@ -1475,6 +1495,7 @@ foreach ($jar in $jarFiles) {
     if ($result.Patterns.Count -gt 0 -or $result.Strings.Count -gt 0 -or $result.Fullwidth.Count -gt 0) {
         $suspiciousMods += [PSCustomObject]@{
             FileName = $jar.Name
+            FilePath = $jar.FullName
             Patterns = $result.Patterns
             Strings  = $result.Strings
             Fullwidth = $result.Fullwidth
@@ -1504,6 +1525,7 @@ foreach ($jar in $jarFiles) {
     if ($bypassFlags.Count -gt 0) {
         $bypassMods += [PSCustomObject]@{
             FileName = $jar.Name
+            FilePath = $jar.FullName
             Flags    = $bypassFlags
         }
         $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
@@ -1529,6 +1551,7 @@ foreach ($jar in $jarFiles) {
         if (-not $alreadyFlagged) {
             $obfuscatedMods += [PSCustomObject]@{
                 FileName = $jar.Name
+                FilePath = $jar.FullName
                 Flags    = $obfFlags
             }
             $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
@@ -1556,7 +1579,7 @@ if ($verifiedMods.Count -gt 0) {
         Write-Host "  ✓ " -ForegroundColor Green -NoNewline
         Write-Host "$($mod.ModName)" -ForegroundColor White -NoNewline
         Write-Host " → " -ForegroundColor Gray -NoNewline
-        Write-Host "$($mod.FileName)" -ForegroundColor DarkGray
+        Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
     }
     Write-Host ""
 }
@@ -1572,6 +1595,10 @@ if ($unknownMods.Count -gt 0) {
         $bottomLine = "  ╚═ " + $sourceText + " " + ("═" * (67 - $sourceText.Length)) + "╝"
         Write-Host $topLine    -ForegroundColor Yellow
         Write-Host $bottomLine -ForegroundColor Yellow
+        if ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers') {
+            Write-Host "  ↳ " -ForegroundColor DarkGray -NoNewline
+            Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
+        }
         Write-Host ""
     }
 }
@@ -1638,6 +1665,107 @@ if ($jvmFlags.Count -gt 0) {
     Write-Host ""
 }
 
+function Write-ResultsFile {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $null = $lines.Add('Meow Mod Analyzer — Results')
+    $null = $lines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $null = $lines.Add("Scan scope: $script:scanMode")
+    $null = $lines.Add("Scanned: $scanWhere")
+    $null = $lines.Add('')
+    $null = $lines.Add('SUMMARY')
+    $null = $lines.Add('-------')
+    $null = $lines.Add("Total files scanned: $totalFiles")
+    $null = $lines.Add("Verified mods:       $($verifiedMods.Count)")
+    $null = $lines.Add("Unknown mods:        $($unknownMods.Count)")
+    $null = $lines.Add("Suspicious mods:     $($suspiciousMods.Count)")
+    $null = $lines.Add("Bypass/Injected:     $($bypassMods.Count)")
+    $null = $lines.Add("Obfuscated mods:     $($obfuscatedMods.Count)")
+    $null = $lines.Add("JVM issues:          $($jvmFlags.Count)")
+
+    if ($verifiedMods.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('VERIFIED MODS')
+        $null = $lines.Add('-------------')
+        foreach ($mod in $verifiedMods) {
+            $null = $lines.Add(("✓ {0} → {1}" -f $mod.ModName, (Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)))
+        }
+    }
+
+    if ($unknownMods.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('UNKNOWN MODS')
+        $null = $lines.Add('------------')
+        foreach ($mod in $unknownMods) {
+            $null = $lines.Add("? $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            $src = if ($mod.DownloadSource) { $mod.DownloadSource } else { '?' }
+            $null = $lines.Add("  Source: $src")
+        }
+    }
+
+    if ($suspiciousMods.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('SUSPICIOUS MODS')
+        $null = $lines.Add('---------------')
+        foreach ($mod in $suspiciousMods) {
+            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            if ($mod.Patterns.Count -gt 0) {
+                $null = $lines.Add('  Patterns:')
+                foreach ($p in ($mod.Patterns | Sort-Object)) { $null = $lines.Add("    $p") }
+            }
+            $uniqueStrings = $mod.Strings | Where-Object { $mod.Patterns -notcontains $_ } | Sort-Object
+            if ($uniqueStrings.Count -gt 0) {
+                $null = $lines.Add('  Strings:')
+                foreach ($s in $uniqueStrings) { $null = $lines.Add("    $s") }
+            }
+            if ($mod.Fullwidth -and $mod.Fullwidth.Count -gt 0) {
+                $null = $lines.Add('  Fullwidth Unicode:')
+                foreach ($fw in ($mod.Fullwidth | Sort-Object)) { $null = $lines.Add("    $fw") }
+            }
+        }
+    }
+
+    if ($bypassMods.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('BYPASS / INJECTION DETECTED')
+        $null = $lines.Add('---------------------------')
+        foreach ($mod in $bypassMods) {
+            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
+        }
+    }
+
+    if ($obfuscatedMods.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('OBFUSCATED MODS')
+        $null = $lines.Add('---------------')
+        foreach ($mod in $obfuscatedMods) {
+            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
+            foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
+        }
+    }
+
+    if ($jvmFlags.Count -gt 0) {
+        $null = $lines.Add('')
+        $null = $lines.Add('JVM / RUNTIME INJECTION')
+        $null = $lines.Add('-----------------------')
+        foreach ($flag in $jvmFlags) { $null = $lines.Add("◉ $flag") }
+    }
+
+    $resultsDir  = if ($env:SystemDrive) { $env:SystemDrive + '\ss' } else { 'C:\ss' }
+    $resultsFile = Join-Path $resultsDir 'MeowModResults.txt'
+
+    try {
+        if (-not (Test-Path -LiteralPath $resultsDir -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $resultsDir -ErrorAction Stop | Out-Null
+        }
+        [System.IO.File]::WriteAllLines($resultsFile, $lines)
+        Write-Host "📝 Results saved to: $resultsFile" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "⚠️  Could not write results file: $resultsFile" -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
+
 Write-Host "📊 SUMMARY" -ForegroundColor Cyan
 Write-Rule "━" 76 Blue
 Write-Host "  Total files scanned: " -ForegroundColor Gray -NoNewline; Write-Host "$totalFiles"                   -ForegroundColor White
@@ -1650,6 +1778,7 @@ Write-Host "  JVM issues:          " -ForegroundColor Gray -NoNewline; Write-Hos
 Write-Host
 Write-Rule "━" 76 Blue
 Write-Host ""
+Write-ResultsFile
 Write-Host "  ✨ Analysis complete! Thanks for using Meow Mod Analyzer 🐱" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  👤 Created by: " -ForegroundColor White -NoNewline

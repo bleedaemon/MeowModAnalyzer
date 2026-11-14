@@ -1374,9 +1374,9 @@ is_skipped_jar_path() {
     case "$lp" in
         */.fabric/processedmods/*|*/.fabric/processedmods|*\\.fabric\\processedmods\\*|*\\.fabric\\processedmods)
             return 0 ;;
-        */libraries/*|*/versions/*|*/runtime/*|*/jre/*|*/jdk/*|*/.gradle/*|*/.m2/*)
+        */libraries/*|*/versions/*|*/runtime/*|*/jre/*|*/jdk/*|*/.gradle/*|*/.m2/*|*/loom-cache/*)
             return 0 ;;
-        *\\libraries\\*|*\\versions\\*|*\\runtime\\*|*\\jre\\*|*\\jdk\\*|*\\.gradle\\*|*\\.m2\\*)
+        *\\libraries\\*|*\\versions\\*|*\\runtime\\*|*\\jre\\*|*\\jdk\\*|*\\.gradle\\*|*\\.m2\\*|*\\loom-cache\\*)
             return 0 ;;
     esac
     base=${p##*/}
@@ -1386,6 +1386,8 @@ is_skipped_jar_path() {
     case "$lb" in
         minecraft*.jar|forge-*.jar|neoforge-*.jar|fabric-loader*.jar|quilt-loader*.jar|authlib*.jar|brigadier*.jar|datafixerupper*.jar|log4j*.jar|netty*.jar|guava*.jar|gson*.jar|asm-*.jar|jopt-simple*.jar|commons-*.jar|slf4j*.jar|lwjgl*.jar|jna*.jar|joml*.jar|oshi*.jar|text2speech*.jar)
             return 0 ;;
+        gradle-wrapper*.jar|remapped.*.jar|remapped-*.jar)
+            return 0 ;;
     esac
     return 1
 }
@@ -1394,7 +1396,7 @@ is_skipped_archive_entry() { # entry path inside an archive
     local e
     e=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     case "$e" in
-        */libraries/*|libraries/*|*/versions/*|versions/*|*/runtime/*|runtime/*|*/jre/*|jre/*|*/jdk/*|jdk/*)
+        */libraries/*|libraries/*|*/versions/*|versions/*|*/runtime/*|runtime/*|*/jre/*|jre/*|*/jdk/*|jdk/*|*/loom-cache/*|loom-cache/*)
             return 0 ;;
         */.fabric/processedmods/*|.fabric/processedmods/*|*\\.fabric\\processedmods\\*|.fabric\\processedmods\\*)
             return 0 ;;
@@ -1472,6 +1474,7 @@ extract_archive_jars() { # archive index
     lower=$(printf '%s' "$archive" | tr '[:upper:]' '[:lower:]')
     dest="$TMPROOT/archives/$idx"
     mkdir -p "$dest" 2>/dev/null || return 0
+    printf '%s' "$archive" > "$dest/.origin" 2>/dev/null || true
 
     case "$lower" in
         *.zip|*.mcpack)
@@ -1557,7 +1560,7 @@ collect_system_jars() {
         if [ $first -eq 1 ]; then first=0; else prune+=( -o ); fi
         prune+=( -path "$d" )
     done
-    for d in .git .svn .hg node_modules __pycache__ .cache .gradle .m2 \
+    for d in .git .svn .hg node_modules __pycache__ .cache .gradle .m2 loom-cache \
              proc sys dev run usr lib lib32 lib64 bin sbin etc boot var nix snap \
              libraries versions runtime jre jdk processedMods assets natives \
              "System Volume Information" Windows "Program Files" "Program Files (x86)" \
@@ -1761,11 +1764,39 @@ printf '%s🔍 Found %s JAR %s to analyze%s\n\n' "$C_GREEN" "$totalFiles" "$file
 # Result stores
 # ---------------------------------------------------------------------------
 verifiedNames=(); verifiedFiles=(); verifiedPaths=(); verifiedWhite=()
-unknownFiles=(); unknownSources=()
-suspFiles=(); suspPatterns=(); suspStrings=(); suspFullwidth=()
-bypassFiles=(); bypassFlags=()
-obfFiles=(); obfFlags=()
+unknownFiles=(); unknownSources=(); unknownPaths=()
+suspFiles=(); suspPatterns=(); suspStrings=(); suspFullwidth=(); suspPaths=()
+bypassFiles=(); bypassFlags=(); bypassPaths=()
+obfFiles=(); obfFlags=(); obfPaths=()
 jvmFlags=()
+
+# Full path for a result entry. In whole-system/launcher scans the analyzed
+# path is shown; archive members show "<archive> → <member>" instead of the
+# temporary extraction path.
+full_mod_path() {
+    local p=$1 d origin
+    case "$p" in
+        "$TMPROOT"/archives/*)
+            d=$(dirname "$p")
+            if [ -f "$d/.origin" ]; then
+                origin=$(cat "$d/.origin" 2>/dev/null)
+                if [ -n "$origin" ]; then
+                    printf '%s → %s' "$origin" "${p##*/}"
+                    return
+                fi
+            fi
+            ;;
+    esac
+    printf '%s' "$p"
+}
+
+# Console label: full path for whole-system/launcher scans, filename otherwise.
+result_label() { # basename fullpath
+    case "$scanMode" in
+        system|launchers) full_mod_path "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
 
 remove_verified() {
     local target=$1 i
@@ -1786,15 +1817,17 @@ remove_verified() {
 
 remove_unknown() {
     local target=$1 i
-    local nFile=() nSource=()
+    local nFile=() nSource=() nPath=()
     for ((i = 0; i < ${#unknownFiles[@]}; i++)); do
         if [ "${unknownFiles[i]}" != "$target" ]; then
             nFile+=("${unknownFiles[i]}")
             nSource+=("${unknownSources[i]}")
+            nPath+=("${unknownPaths[i]}")
         fi
     done
     unknownFiles=("${nFile[@]}")
     unknownSources=("${nSource[@]}")
+    unknownPaths=("${nPath[@]}")
 }
 
 is_modrinth_whitelisted() {
@@ -2239,6 +2272,7 @@ for jar in "${jarFiles[@]}"; do
     src=$(get_download_source "$jar")
     unknownFiles+=("$filename")
     unknownSources+=("$src")
+    unknownPaths+=("$jar")
 done
 printf '\r%*s\r' 100 ''
 
@@ -2269,6 +2303,7 @@ for jar in "${jarFiles[@]}"; do
         suspPatterns+=("$(cat "$SCAN_WORK/pats" 2>/dev/null)")
         suspStrings+=("$(cat "$SCAN_WORK/strs" 2>/dev/null)")
         suspFullwidth+=("$(cat "$SCAN_WORK/fwres" 2>/dev/null)")
+        suspPaths+=("$jar")
         remove_verified "$filename"
     fi
 done
@@ -2298,6 +2333,7 @@ for jar in "${jarFiles[@]}"; do
     if [ -s "$SCAN_WORK/flags" ]; then
         bypassFiles+=("$filename")
         bypassFlags+=("$(cat "$SCAN_WORK/flags" 2>/dev/null)")
+        bypassPaths+=("$jar")
         remove_verified "$filename"
         remove_unknown "$filename"
     fi
@@ -2328,6 +2364,7 @@ for jar in "${jarFiles[@]}"; do
         if [ "$alreadyFlagged" = "false" ]; then
             obfFiles+=("$filename")
             obfFlags+=("$(cat "$SCAN_WORK/flags" 2>/dev/null)")
+            obfPaths+=("$jar")
             remove_verified "$filename"
         fi
     fi
@@ -2356,7 +2393,7 @@ if [ ${#verifiedFiles[@]} -gt 0 ]; then
     for ((i = 0; i < ${#verifiedFiles[@]}; i++)); do
         printf '  %s✓ %s%s%s%s → %s%s%s\n' \
             "$C_GREEN" "${C_RESET}${C_WHITE}" "${verifiedNames[i]}" "$C_RESET" \
-            "$C_GRAY" "$C_DARKGRAY" "${verifiedFiles[i]}" "$C_RESET"
+            "$C_GRAY" "$C_DARKGRAY" "$(result_label "${verifiedFiles[i]}" "${verifiedPaths[i]}")" "$C_RESET"
     done
     printf '\n'
 fi
@@ -2381,7 +2418,13 @@ if [ ${#unknownFiles[@]} -gt 0 ]; then
         topLine="  ╔═ ? $name $(repeat_char "═" $((65 - ${#name})))╗"
         bottomLine="  ╚═ $sourceText $(repeat_char "═" $((67 - ${#sourceText})))╝"
         printf '%s%s%s\n' "$C_YELLOW" "$topLine" "$C_RESET"
-        printf '%s%s%s\n\n' "$C_YELLOW" "$bottomLine" "$C_RESET"
+        printf '%s%s%s\n' "$C_YELLOW" "$bottomLine" "$C_RESET"
+        case "$scanMode" in
+            system|launchers)
+                printf '  %s↳ %s%s\n' "$C_DARKGRAY" "$(result_label "${unknownFiles[i]}" "${unknownPaths[i]}")" "$C_RESET"
+                ;;
+        esac
+        printf '\n'
     done
 fi
 
@@ -2393,7 +2436,7 @@ if [ ${#suspFiles[@]} -gt 0 ]; then
     write_rule "─" 76 "$C_DARKGRAY"
     printf '\n'
     for ((i = 0; i < ${#suspFiles[@]}; i++)); do
-        write_suspicious_card "${suspFiles[i]}" "${suspPatterns[i]}" "${suspStrings[i]}" "${suspFullwidth[i]}"
+        write_suspicious_card "$(result_label "${suspFiles[i]}" "${suspPaths[i]}")" "${suspPatterns[i]}" "${suspStrings[i]}" "${suspFullwidth[i]}"
     done
 fi
 
@@ -2405,7 +2448,7 @@ if [ ${#bypassFiles[@]} -gt 0 ]; then
     write_rule "─" 76 "$C_DARKGRAY"
     printf '\n'
     for ((i = 0; i < ${#bypassFiles[@]}; i++)); do
-        write_flag_card "${bypassFiles[i]}" "${bypassFlags[i]}" "INJECTION" "◉" "$C_BG_DARKMAGENTA"
+        write_flag_card "$(result_label "${bypassFiles[i]}" "${bypassPaths[i]}")" "${bypassFlags[i]}" "INJECTION" "◉" "$C_BG_DARKMAGENTA"
     done
 fi
 
@@ -2418,7 +2461,7 @@ if [ ${#obfFiles[@]} -gt 0 ]; then
     printf '\n'
     for ((i = 0; i < ${#obfFiles[@]}; i++)); do
         # Obfuscation cards use DarkYellow framing and a flag bullet
-        file="${obfFiles[i]}"
+        file=$(result_label "${obfFiles[i]}" "${obfPaths[i]}")
         flags="${obfFlags[i]}"
         printf '%s  %s%s\n' "$C_DARKYELLOW" "$(repeat_char "─" 70)" "$C_RESET"
         printf '%s  │ %s%s OBFUSCATED %s  %s%s%s\n' \
@@ -2487,6 +2530,107 @@ if [ ${#jvmFlags[@]} -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Results file
+# ---------------------------------------------------------------------------
+write_results_file() {
+    local outdir outfile line i
+    outdir="${HOME:-.}/ss"
+    outfile="$outdir/MeowModResults.txt"
+
+    if ! mkdir -p "$outdir" 2>/dev/null; then
+        printf '%s⚠️  Could not create results folder: %s%s\n\n' "$C_YELLOW" "$outdir" "$C_RESET"
+        return 1
+    fi
+
+    {
+        printf 'Meow Mod Analyzer — Results\n'
+        printf 'Generated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'Scan scope: %s\n' "$scanMode"
+        printf 'Scanned: %s\n' "$scanWhere"
+        printf '\nSUMMARY\n-------\n'
+        printf 'Total files scanned: %s\n' "$totalFiles"
+        printf 'Verified mods:       %s\n' "${#verifiedFiles[@]}"
+        printf 'Unknown mods:        %s\n' "${#unknownFiles[@]}"
+        printf 'Suspicious mods:     %s\n' "${#suspFiles[@]}"
+        printf 'Bypass/Injected:     %s\n' "${#bypassFiles[@]}"
+        printf 'Obfuscated mods:     %s\n' "${#obfFiles[@]}"
+        printf 'JVM issues:          %s\n' "${#jvmFlags[@]}"
+
+        if [ ${#verifiedFiles[@]} -gt 0 ]; then
+            printf '\nVERIFIED MODS\n-------------\n'
+            for ((i = 0; i < ${#verifiedFiles[@]}; i++)); do
+                printf '✓ %s → %s\n' "${verifiedNames[i]}" "$(full_mod_path "${verifiedPaths[i]}")"
+            done
+        fi
+
+        if [ ${#unknownFiles[@]} -gt 0 ]; then
+            printf '\nUNKNOWN MODS\n------------\n'
+            for ((i = 0; i < ${#unknownFiles[@]}; i++)); do
+                printf '? %s\n' "$(full_mod_path "${unknownPaths[i]}")"
+                printf '  Source: %s\n' "${unknownSources[i]:-?}"
+            done
+        fi
+
+        if [ ${#suspFiles[@]} -gt 0 ]; then
+            printf '\nSUSPICIOUS MODS\n---------------\n'
+            for ((i = 0; i < ${#suspFiles[@]}; i++)); do
+                printf '! %s\n' "$(full_mod_path "${suspPaths[i]}")"
+                if [ -n "${suspPatterns[i]}" ]; then
+                    printf '  Patterns:\n'
+                    while IFS= read -r line; do
+                        [ -n "$line" ] && printf '    %s\n' "$line"
+                    done <<< "${suspPatterns[i]}"
+                fi
+                if [ -n "${suspStrings[i]}" ]; then
+                    printf '  Strings:\n'
+                    while IFS= read -r line; do
+                        [ -n "$line" ] && printf '    %s\n' "$line"
+                    done <<< "${suspStrings[i]}"
+                fi
+                if [ -n "${suspFullwidth[i]}" ]; then
+                    printf '  Fullwidth Unicode:\n'
+                    while IFS= read -r line; do
+                        [ -n "$line" ] && printf '    %s\n' "$line"
+                    done <<< "${suspFullwidth[i]}"
+                fi
+            done
+        fi
+
+        if [ ${#bypassFiles[@]} -gt 0 ]; then
+            printf '\nBYPASS / INJECTION DETECTED\n---------------------------\n'
+            for ((i = 0; i < ${#bypassFiles[@]}; i++)); do
+                printf '! %s\n' "$(full_mod_path "${bypassPaths[i]}")"
+                while IFS= read -r line; do
+                    [ -n "$line" ] && printf '    %s\n' "$line"
+                done <<< "${bypassFlags[i]}"
+            done
+        fi
+
+        if [ ${#obfFiles[@]} -gt 0 ]; then
+            printf '\nOBFUSCATED MODS\n---------------\n'
+            for ((i = 0; i < ${#obfFiles[@]}; i++)); do
+                printf '! %s\n' "$(full_mod_path "${obfPaths[i]}")"
+                while IFS= read -r line; do
+                    [ -n "$line" ] && printf '    %s\n' "$line"
+                done <<< "${obfFlags[i]}"
+            done
+        fi
+
+        if [ ${#jvmFlags[@]} -gt 0 ]; then
+            printf '\nJVM / RUNTIME INJECTION\n-----------------------\n'
+            for line in "${jvmFlags[@]}"; do
+                [ -n "$line" ] && printf '◉ %s\n' "$line"
+            done
+        fi
+    } > "$outfile" 2>/dev/null || {
+        printf '%s⚠️  Could not write results file: %s%s\n\n' "$C_YELLOW" "$outfile" "$C_RESET"
+        return 1
+    }
+
+    printf '%s📝 Results saved to: %s%s\n\n' "$C_GRAY" "$outfile" "$C_RESET"
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf '%s📊 SUMMARY%s\n' "$C_CYAN" "$C_RESET"
@@ -2501,6 +2645,7 @@ printf '%s  JVM issues:          %s%s%s\n' "$C_GRAY" "$C_YELLOW" "${#jvmFlags[@]
 printf '\n'
 write_rule "━" 76 "$C_BLUE"
 printf '\n'
+write_results_file
 printf '%s  ✨ Analysis complete! Thanks for using Meow Mod Analyzer 🐱%s\n' "$C_CYAN" "$C_RESET"
 printf '\n'
 printf '%s  👤 Created by: %s' "$C_WHITE" "$C_RESET"
