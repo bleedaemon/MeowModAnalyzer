@@ -43,30 +43,348 @@ Write-Host ""
 Write-Host ("━" * 76) -ForegroundColor DarkCyan
 Write-Host
 
-Write-Host "Enter path to the mods folder: " -NoNewline
-Write-Host "(press Enter to use default)" -ForegroundColor DarkGray
-$modsPath = Read-Host "PATH"
+# ---------------------------------------------------------------------------
+# Scan-scope helpers
+# ---------------------------------------------------------------------------
+$script:SkipDirNames = @(
+    '.git','.svn','.hg','node_modules','__pycache__','.cache','.gradle','.m2',
+    'proc','sys','dev','run','usr','lib','lib32','lib64','bin','sbin','etc','boot','var','nix','snap',
+    'libraries','versions','runtime','jre','jdk','processedMods','assets','natives',
+    'System Volume Information','Windows','Program Files','Program Files (x86)',
+    'ProgramData','Windows.old','Recovery','PerfLogs'
+)
+
+$script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
+
+function Remove-ArchiveTemp {
+    if ($script:ArchiveTemp -and (Test-Path -LiteralPath $script:ArchiveTemp)) {
+        Remove-Item -LiteralPath $script:ArchiveTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-NormPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    try { return [System.IO.Path]::GetFullPath($Path).TrimEnd('\','/') }
+    catch { return $Path.TrimEnd('\','/') }
+}
+
+function Test-IsSystemDir {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = Get-NormPath $Path
+    $homeDir = ''
+    if ($env:USERPROFILE) { $homeDir = Get-NormPath $env:USERPROFILE }
+    elseif ($env:HOME)   { $homeDir = Get-NormPath $env:HOME }
+    if ($homeDir -and $p -ieq $homeDir) { return $true }
+    if ($p -eq '' -or $p -eq '/' -or $p -match '^[A-Za-z]:$') { return $true }
+
+    $roots = @()
+    foreach ($v in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData,
+                     '/bin','/sbin','/usr','/usr/bin','/usr/sbin','/usr/local','/usr/lib','/lib','/lib64',
+                     '/etc','/var','/opt','/boot','/run','/proc','/sys','/dev','/snap','/nix',
+                     '/System','/Library','/Applications','/private')) {
+        if ($v) {
+            $n = Get-NormPath $v
+            if ($n) { $roots += $n }
+        }
+    }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    foreach ($r in $roots) {
+        if ($p -ieq $r) { return $true }
+        if ($p.StartsWith($r + $sep, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-DefaultMinecraftMods {
+    if ($env:APPDATA) { return (Join-Path $env:APPDATA '.minecraft\mods') }
+    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+    if ($homeDir) { return (Join-Path (Join-Path $homeDir '.minecraft') 'mods') }
+    return '.minecraft\mods'
+}
+
+function Get-DefaultCustomPath {
+    $pwdPath = (Get-Location).Path
+    if ($pwdPath -and -not (Test-IsSystemDir $pwdPath)) { return $pwdPath }
+    return (Get-DefaultMinecraftMods)
+}
+
+function Test-SkipJarPath {
+    param([string]$Path)
+    $p = $Path -replace '/','\'
+    $lp = $p.ToLowerInvariant()
+    if ($lp -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
+    if ($lp -match '\\(libraries|versions|runtime|jre|jdk|\.gradle|\.m2)\\') { return $true }
+
+    $name = [System.IO.Path]::GetFileName($p).ToLowerInvariant()
+    foreach ($pat in @('minecraft*.jar','forge-*.jar','neoforge-*.jar','fabric-loader*.jar','quilt-loader*.jar',
+                       'authlib*.jar','brigadier*.jar','datafixerupper*.jar','log4j*.jar','netty*.jar','guava*.jar',
+                       'gson*.jar','asm-*.jar','jopt-simple*.jar','commons-*.jar','slf4j*.jar','lwjgl*.jar',
+                       'jna*.jar','joml*.jar','oshi*.jar','text2speech*.jar')) {
+        if ($name -like $pat) { return $true }
+    }
+    return $false
+}
+
+function Add-JarFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    if (Test-SkipJarPath $Path) { return }
+    try { $full = (Resolve-Path -LiteralPath $Path).Path } catch { return }
+    if (-not $script:JarSeen.Add($full)) { return }
+    [void]$script:JarFiles.Add([PSCustomObject]@{
+        FullName = $full
+        Name     = [System.IO.Path]::GetFileName($full)
+    })
+}
+
+function Get-ModsDirJars {
+    param([string]$Dir)
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
+    Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ieq '.jar' } |
+        ForEach-Object { Add-JarFile $_.FullName }
+}
+
+function Get-LauncherModDirs {
+    $dirs  = New-Object System.Collections.ArrayList
+    $bases = New-Object System.Collections.ArrayList
+    $lunar = New-Object System.Collections.ArrayList
+
+    [void]$dirs.Add((Get-DefaultMinecraftMods))
+
+    if ($env:APPDATA) {
+        [void]$bases.Add((Join-Path $env:APPDATA 'PrismLauncher\instances'))
+    }
+    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+    if ($homeDir) {
+        [void]$bases.Add((Join-Path $homeDir '.local/share/PrismLauncher/instances'))
+        [void]$bases.Add((Join-Path $homeDir '.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances'))
+        [void]$bases.Add((Join-Path $homeDir 'Library/Application Support/PrismLauncher/instances'))
+        [void]$lunar.Add((Join-Path $homeDir '.lunarclient'))
+        [void]$lunar.Add((Join-Path $homeDir 'Library/Application Support/lunarclient'))
+    }
+
+    foreach ($base in $bases) {
+        if (-not (Test-Path -LiteralPath $base -PathType Container)) { continue }
+        Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            [void]$dirs.Add((Join-Path (Join-Path $_.FullName 'minecraft') 'mods'))
+            [void]$dirs.Add((Join-Path (Join-Path $_.FullName '.minecraft') 'mods'))
+        }
+    }
+
+    foreach ($root in $lunar) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ieq 'mods' } |
+            ForEach-Object { [void]$dirs.Add($_.FullName) }
+    }
+
+    return ($dirs | Select-Object -Unique)
+}
+
+function Get-SystemRoots {
+    $roots = New-Object System.Collections.ArrayList
+    try {
+        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+            if ($drive.DriveType -eq [System.IO.DriveType]::Fixed -and $drive.IsReady) {
+                [void]$roots.Add($drive.RootDirectory.FullName)
+            }
+        }
+    } catch { }
+    if ($roots.Count -eq 0) {
+        if ($env:SystemDrive) { [void]$roots.Add($env:SystemDrive + '\') }
+        else { [void]$roots.Add('/') }
+    }
+    return $roots
+}
+
+function Test-SkipArchiveEntry {
+    param([string]$Entry)
+    $e = ($Entry -replace '/','\').ToLowerInvariant()
+    if ($e -match '(^|\\)(libraries|versions|runtime|jre|jdk)(\\|$)') { return $true }
+    if ($e -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
+    return $false
+}
+
+function Expand-ArchiveJars {
+    param([string]$Archive, [int]$Index)
+
+    $dest = Join-Path $script:ArchiveTemp ("a{0}" -f $Index)
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+    $fileName = [System.IO.Path]::GetFileName($Archive).ToLowerInvariant()
+    $ext      = [System.IO.Path]::GetExtension($Archive).ToLowerInvariant()
+
+    if ($ext -eq '.zip' -or $ext -eq '.mcpack') {
+        try {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+            try {
+                foreach ($entry in $zip.Entries) {
+                    if ($entry.FullName -notmatch '(?i)\.jar$') { continue }
+                    if (Test-SkipArchiveEntry $entry.FullName) { continue }
+                    $base = [System.IO.Path]::GetFileName($entry.FullName)
+                    if (-not $base) { continue }
+                    try {
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $dest $base), $true)
+                    } catch { }
+                }
+            } finally { $zip.Dispose() }
+        } catch { }
+    }
+    elseif ($fileName -like '*.tar.gz' -or $fileName -like '*.tgz' -or $ext -eq '.tar') {
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+        if ($tar) {
+            & $tar.Source -xf $Archive -C $dest '*.jar' '*.JAR' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                & $tar.Source -xf $Archive -C $dest '*.jar' 2>$null | Out-Null
+            }
+        }
+    }
+    elseif ($ext -eq '.rar' -or $ext -eq '.7z') {
+        $seven = Get-Command 7z -ErrorAction SilentlyContinue
+        if (-not $seven) { $seven = Get-Command 7za -ErrorAction SilentlyContinue }
+        if ($seven) {
+            & $seven.Source x -y ("-o{0}" -f $dest) $Archive '*.jar' 2>$null | Out-Null
+        }
+        elseif ($ext -eq '.rar') {
+            $unrar = Get-Command unrar -ErrorAction SilentlyContinue
+            if ($unrar) {
+                & $unrar.Source x -o+ -inul $Archive '*.jar' ($dest + [System.IO.Path]::DirectorySeparatorChar) 2>$null | Out-Null
+            } else {
+                $bsdtar = Get-Command bsdtar -ErrorAction SilentlyContinue
+                if ($bsdtar) { & $bsdtar.Source -xf $Archive -C $dest '*.jar' 2>$null | Out-Null }
+            }
+        }
+    }
+
+    Get-ChildItem -LiteralPath $dest -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -ieq '.jar' } |
+        ForEach-Object { Add-JarFile $_.FullName }
+}
+
+function Add-SystemJars {
+    $archives = New-Object System.Collections.ArrayList
+    $systemPaths = @('/System','/private','/Applications','/cores','/tmp')
+
+    foreach ($root in (Get-SystemRoots)) {
+        Write-Host "   searching: $root" -ForegroundColor Gray
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($root)
+
+        while ($stack.Count -gt 0) {
+            $dir = [string]$stack.Pop()
+
+            try {
+                foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
+                    $ext  = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+                    $name = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
+                    if ($ext -eq '.jar') {
+                        Add-JarFile $file
+                    }
+                    elseif ($ext -eq '.zip' -or $ext -eq '.mcpack' -or $ext -eq '.rar' -or
+                            $ext -eq '.7z' -or $ext -eq '.tar' -or $ext -eq '.tgz' -or
+                            $name -like '*.tar.gz') {
+                        [void]$archives.Add($file)
+                    }
+                }
+            } catch { }
+
+            try {
+                foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                    $subName = [System.IO.Path]::GetFileName($sub)
+                    if ($script:SkipDirNames -contains $subName) { continue }
+                    if ($systemPaths -contains $sub) { continue }
+                    if ($sub -ieq $script:ArchiveTemp) { continue }
+                    try {
+                        if (([System.IO.File]::GetAttributes($sub) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    } catch { continue }
+                    [void]$stack.Push($sub)
+                }
+            } catch { }
+        }
+    }
+
+    Write-Host "   archives found: $($archives.Count)" -ForegroundColor Gray
+    $i = 0
+    foreach ($archive in $archives) {
+        $i++
+        Expand-ArchiveJars -Archive $archive -Index $i
+    }
+}
+
+Write-Host "Select scan scope:" -ForegroundColor White
+Write-Host "  1) " -ForegroundColor Cyan -NoNewline
+Write-Host "Whole system (jars + .zip/.tar.gz/.rar/.mcpack archives + recycle bin)" -ForegroundColor DarkGray
+Write-Host "  2) " -ForegroundColor Cyan -NoNewline
+Write-Host "Launchers only (PrismLauncher + Lunar + .minecraft)" -ForegroundColor DarkGray
+$defPath = Get-DefaultCustomPath
+Write-Host "  3) " -ForegroundColor Cyan -NoNewline
+Write-Host "Custom folder " -ForegroundColor DarkGray -NoNewline
+Write-Host "(default: $defPath)" -ForegroundColor DarkGray
+Write-Host "Choice " -ForegroundColor DarkGray -NoNewline
+Write-Host "[3]" -ForegroundColor DarkGray -NoNewline
+Write-Host ": " -NoNewline
+$scanChoice = Read-Host
+if ([string]::IsNullOrWhiteSpace($scanChoice)) { $scanChoice = '3' }
+while (@('1','2','3') -notcontains $scanChoice) {
+    Write-Host "Please enter 1, 2 or 3: " -ForegroundColor Yellow -NoNewline
+    $scanChoice = Read-Host
+    if ([string]::IsNullOrWhiteSpace($scanChoice)) { $scanChoice = '3' }
+}
 Write-Host
 
-if ([string]::IsNullOrWhiteSpace($modsPath)) {
-    $modsPath = "$env:USERPROFILE\AppData\Roaming\.minecraft\mods"
-    Write-Host "Continuing with " -NoNewline
-    Write-Host $modsPath -ForegroundColor White
-    Write-Host
+$modsPath = $null
+switch ($scanChoice) {
+    '1' { $scanMode = 'system' }
+    '2' { $scanMode = 'launchers' }
+    '3' {
+        $scanMode = 'custom'
+        Write-Host "Enter path to the mods folder: " -NoNewline
+        Write-Host "(press Enter to use default)" -ForegroundColor DarkGray
+        Write-Host "PATH [$defPath]: " -NoNewline
+        $modsPath = Read-Host
+        Write-Host
+        if (-not [string]::IsNullOrWhiteSpace($modsPath)) {
+            $modsPath = $modsPath.Trim().Trim([char[]]@('"', "'"))
+        }
+        if ([string]::IsNullOrWhiteSpace($modsPath)) {
+            $modsPath = $defPath
+            Write-Host "Continuing with " -NoNewline
+            Write-Host $modsPath -ForegroundColor White
+            Write-Host
+        }
+        if (-not (Test-Path -LiteralPath $modsPath -PathType Container)) {
+            Write-Host "❌ Invalid Path!" -ForegroundColor Red
+            Write-Host "The directory does not exist or is not accessible." -ForegroundColor Yellow
+            Write-Host
+            Write-Host "Tried to access: $modsPath" -ForegroundColor Gray
+            Write-Host
+            Write-Host "Press any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            exit 1
+        }
+    }
 }
 
-if (-not (Test-Path $modsPath -PathType Container)) {
-    Write-Host "❌ Invalid Path!" -ForegroundColor Red
-    Write-Host "The directory does not exist or is not accessible." -ForegroundColor Yellow
-    Write-Host
-    Write-Host "Tried to access: $modsPath" -ForegroundColor Gray
-    Write-Host
-    Write-Host "Press any key to exit..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-    exit 1
+switch ($scanMode) {
+    'system'    {
+        Write-Host "📁 Scan scope: whole system (recycle bin included)" -ForegroundColor Green
+        Write-Host "⚠️  Whole-system scans can take a long time (archive extraction + network lookups)." -ForegroundColor Yellow
+        Write-Host
+        $scanWhere = 'the whole system'
+    }
+    'launchers' {
+        Write-Host "📁 Scan scope: PrismLauncher / Lunar / .minecraft" -ForegroundColor Green
+        $scanWhere = 'the launcher mod folders'
+    }
+    'custom'    {
+        Write-Host "📁 Scanning directory: $modsPath" -ForegroundColor Green
+        $scanWhere = $modsPath
+    }
 }
-
-Write-Host "📁 Scanning directory: $modsPath" -ForegroundColor Green
 Write-Host
 
 $mcProcess = Get-Process javaw -ErrorAction SilentlyContinue
@@ -1044,17 +1362,44 @@ $suspiciousMods  = @()
 $bypassMods      = @()
 $obfuscatedMods  = @()
 
+$script:JarFiles = New-Object System.Collections.ArrayList
+$script:JarSeen  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 try {
-    $jarFiles = Get-ChildItem -Path $modsPath -Filter *.jar -ErrorAction Stop
+    switch ($scanMode) {
+        'system' {
+            Add-SystemJars
+        }
+        'launchers' {
+            $foundDirs = 0
+            foreach ($d in (Get-LauncherModDirs)) {
+                if (Test-Path -LiteralPath $d -PathType Container) {
+                    Write-Host "   • $d" -ForegroundColor Gray
+                    Get-ModsDirJars $d
+                    $foundDirs++
+                }
+            }
+            if ($foundDirs -eq 0) {
+                Write-Host "   (no launcher mod folders found)" -ForegroundColor Yellow
+            }
+        }
+        'custom' {
+            Get-ModsDirJars $modsPath
+        }
+    }
 } catch {
     Write-Host "❌ Error accessing directory: $_" -ForegroundColor Red
+    Remove-ArchiveTemp
     Write-Host "Press any key to exit..." -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
+$jarFiles = @($script:JarFiles)
+
 if ($jarFiles.Count -eq 0) {
-    Write-Host "⚠️  No JAR files found in: $modsPath" -ForegroundColor Yellow
+    Write-Host "⚠️  No JAR files found in: $scanWhere" -ForegroundColor Yellow
+    Remove-ArchiveTemp
     Write-Host "Press any key to exit..." -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 0
@@ -1326,4 +1671,5 @@ Write-Host ""
 Write-Rule "━" 76 Blue
 Write-Host ""
 Write-Host "Press any key to exit..." -ForegroundColor DarkGray
+Remove-ArchiveTemp
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

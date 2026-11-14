@@ -1307,6 +1307,293 @@ process_uptime() { # pid -> seconds
 }
 
 # ---------------------------------------------------------------------------
+# Scan-scope helpers
+# ---------------------------------------------------------------------------
+is_windows_shell() {
+    case "$OSTYPE" in
+        msys*|cygwin*|win32*) return 0 ;;
+    esac
+    return 1
+}
+
+is_system_dir() { # path -> 0 if it is a home/system directory
+    local p=$1 lower prefix
+    [ -z "$p" ] && return 1
+    p=${p%/}
+    [ -z "$p" ] && p="/"
+    [ "$p" = "$HOME" ] && return 0
+    [ "$p" = "/" ] && return 0
+    for prefix in /bin /sbin /usr /lib /lib64 /lib32 /etc /var /opt /boot /run /proc /sys /dev /snap /nix /System /Library /Applications /private; do
+        case "$p" in
+            "$prefix"|"$prefix"/*) return 0 ;;
+        esac
+    done
+    lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        c:/windows|c:/windows/*|c:/program\ files|c:/program\ files/*|c:/program\ files\ \(x86\)|c:/program\ files\ \(x86\)/*|c:/programdata|c:/programdata/*)
+            return 0 ;;
+        /mnt/c/windows|/mnt/c/windows/*|/mnt/c/program\ files|/mnt/c/program\ files/*|/mnt/c/program\ files\ \(x86\)|/mnt/c/program\ files\ \(x86\)/*|/mnt/c/programdata|/mnt/c/programdata/*|/c/windows|/c/windows/*|/c/program\ files|/c/program\ files/*|/c/program\ files\ \(x86\)|/c/program\ files\ \(x86\)/*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+default_minecraft_mods() {
+    local p="" winappdata
+    case "$OSTYPE" in
+        darwin*)
+            p="$HOME/Library/Application Support/minecraft/mods"
+            ;;
+        msys*|cygwin*|win32*)
+            p="${APPDATA:-$HOME/AppData/Roaming}/.minecraft/mods"
+            ;;
+        *)
+            if grep -qi microsoft /proc/version 2>/dev/null && command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
+                winappdata=$(cmd.exe /c echo %APPDATA% 2>/dev/null | tr -d '\r\n')
+                if [ -n "$winappdata" ]; then
+                    p="$(wslpath -u "$winappdata" 2>/dev/null)/.minecraft/mods"
+                fi
+            fi
+            [ -z "$p" ] && p="$HOME/.minecraft/mods"
+            ;;
+    esac
+    printf '%s' "$p"
+}
+
+default_custom_path() {
+    if [ -n "$PWD" ] && ! is_system_dir "$PWD"; then
+        printf '%s' "$PWD"
+    else
+        default_minecraft_mods
+    fi
+}
+
+is_skipped_jar_path() {
+    local p=$1 lp base lb
+    lp=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+    case "$lp" in
+        */.fabric/processedmods/*|*/.fabric/processedmods|*\\.fabric\\processedmods\\*|*\\.fabric\\processedmods)
+            return 0 ;;
+        */libraries/*|*/versions/*|*/runtime/*|*/jre/*|*/jdk/*|*/.gradle/*|*/.m2/*)
+            return 0 ;;
+        *\\libraries\\*|*\\versions\\*|*\\runtime\\*|*\\jre\\*|*\\jdk\\*|*\\.gradle\\*|*\\.m2\\*)
+            return 0 ;;
+    esac
+    base=${p##*/}
+    base=${base##*\\}
+    [ -z "$base" ] && return 1
+    lb=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+    case "$lb" in
+        minecraft*.jar|forge-*.jar|neoforge-*.jar|fabric-loader*.jar|quilt-loader*.jar|authlib*.jar|brigadier*.jar|datafixerupper*.jar|log4j*.jar|netty*.jar|guava*.jar|gson*.jar|asm-*.jar|jopt-simple*.jar|commons-*.jar|slf4j*.jar|lwjgl*.jar|jna*.jar|joml*.jar|oshi*.jar|text2speech*.jar)
+            return 0 ;;
+    esac
+    return 1
+}
+
+is_skipped_archive_entry() { # entry path inside an archive
+    local e
+    e=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$e" in
+        */libraries/*|libraries/*|*/versions/*|versions/*|*/runtime/*|runtime/*|*/jre/*|jre/*|*/jdk/*|jdk/*)
+            return 0 ;;
+        */.fabric/processedmods/*|.fabric/processedmods/*|*\\.fabric\\processedmods\\*|.fabric\\processedmods\\*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+add_jar_file() {
+    local p=$1
+    [ -f "$p" ] && [ -r "$p" ] || return 0
+    is_skipped_jar_path "$p" && return 0
+    jarFiles+=("$p")
+}
+
+collect_mods_dir_jars() { # dir
+    local dir=$1 j
+    [ -d "$dir" ] || return 0
+    while IFS= read -r j; do
+        [ -n "$j" ] && add_jar_file "$j"
+    done < <(find "$dir" -maxdepth 1 -type f -iname '*.jar' 2>/dev/null)
+}
+
+collect_launcher_jars() {
+    local dirs=() bases=() lunar=() seen=() root d inst base dup
+    local j
+
+    dirs+=("$(default_minecraft_mods)")
+
+    if is_windows_shell; then
+        bases+=("${APPDATA:-$HOME/AppData/Roaming}/PrismLauncher/instances")
+        lunar+=("$HOME/.lunarclient")
+    else
+        bases+=("$HOME/.local/share/PrismLauncher/instances")
+        bases+=("$HOME/.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances")
+        bases+=("$HOME/Library/Application Support/PrismLauncher/instances")
+        lunar+=("$HOME/.lunarclient")
+        lunar+=("$HOME/Library/Application Support/lunarclient")
+    fi
+
+    for base in "${bases[@]}"; do
+        [ -d "$base" ] || continue
+        while IFS= read -r inst; do
+            [ -n "$inst" ] || continue
+            dirs+=("$inst/minecraft/mods")
+            dirs+=("$inst/.minecraft/mods")
+        done < <(find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    done
+
+    for root in "${lunar[@]}"; do
+        [ -d "$root" ] || continue
+        while IFS= read -r d; do
+            [ -n "$d" ] && dirs+=("$d")
+        done < <(find "$root" -type d -iname 'mods' 2>/dev/null)
+    done
+
+    for d in "${dirs[@]}"; do
+        [ -d "$d" ] || continue
+        dup=0
+        for inst in "${seen[@]}"; do
+            [ "$inst" = "$d" ] && dup=1
+        done
+        [ "$dup" -eq 1 ] && continue
+        seen+=("$d")
+        printf '%s   • %s%s\n' "$C_GRAY" "$d" "$C_RESET"
+        collect_mods_dir_jars "$d"
+    done
+
+    if [ ${#seen[@]} -eq 0 ]; then
+        printf '%s   (no launcher mod folders found)%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+}
+
+extract_archive_jars() { # archive index
+    local archive=$1 idx=$2 lower dest entry base
+    lower=$(printf '%s' "$archive" | tr '[:upper:]' '[:lower:]')
+    dest="$TMPROOT/archives/$idx"
+    mkdir -p "$dest" 2>/dev/null || return 0
+
+    case "$lower" in
+        *.zip|*.mcpack)
+            if command -v unzip >/dev/null 2>&1; then
+                while IFS= read -r entry; do
+                    [ -n "$entry" ] || continue
+                    is_skipped_archive_entry "$entry" && continue
+                    base=${entry##*/}
+                    [ -n "$base" ] || continue
+                    unzip -p "$archive" "$entry" > "$dest/$base" 2>/dev/null || rm -f "$dest/$base"
+                done < <(unzip -Z1 "$archive" 2>/dev/null | grep -iE '\.jar$')
+            fi
+            ;;
+        *.tar.gz|*.tgz|*.tar)
+            if command -v tar >/dev/null 2>&1; then
+                while IFS= read -r entry; do
+                    [ -n "$entry" ] || continue
+                    is_skipped_archive_entry "$entry" && continue
+                    base=${entry##*/}
+                    [ -n "$base" ] || continue
+                    tar -xOf "$archive" "$entry" > "$dest/$base" 2>/dev/null || rm -f "$dest/$base"
+                done < <(tar -tf "$archive" 2>/dev/null | grep -iE '\.jar$')
+            fi
+            ;;
+        *.rar)
+            if command -v unrar >/dev/null 2>&1; then
+                while IFS= read -r entry; do
+                    [ -n "$entry" ] || continue
+                    is_skipped_archive_entry "$entry" && continue
+                    base=${entry##*/}
+                    [ -n "$base" ] || continue
+                    unrar p -inul "$archive" "$entry" > "$dest/$base" 2>/dev/null || rm -f "$dest/$base"
+                done < <(unrar lb "$archive" 2>/dev/null | grep -iE '\.jar$')
+            elif command -v 7z >/dev/null 2>&1; then
+                7z x -y -o"$dest" "$archive" '*.jar' >/dev/null 2>&1 || true
+            elif command -v bsdtar >/dev/null 2>&1; then
+                while IFS= read -r entry; do
+                    [ -n "$entry" ] || continue
+                    is_skipped_archive_entry "$entry" && continue
+                    base=${entry##*/}
+                    [ -n "$base" ] || continue
+                    bsdtar -xOf "$archive" "$entry" > "$dest/$base" 2>/dev/null || rm -f "$dest/$base"
+                done < <(bsdtar -tf "$archive" 2>/dev/null | grep -iE '\.jar$')
+            elif command -v unar >/dev/null 2>&1; then
+                unar -q -o "$dest" "$archive" >/dev/null 2>&1 || true
+            fi
+            ;;
+        *.7z)
+            if command -v 7z >/dev/null 2>&1; then
+                7z x -y -o"$dest" "$archive" '*.jar' >/dev/null 2>&1 || true
+            elif command -v bsdtar >/dev/null 2>&1; then
+                while IFS= read -r entry; do
+                    [ -n "$entry" ] || continue
+                    is_skipped_archive_entry "$entry" && continue
+                    base=${entry##*/}
+                    [ -n "$base" ] || continue
+                    bsdtar -xOf "$archive" "$entry" > "$dest/$base" 2>/dev/null || rm -f "$dest/$base"
+                done < <(bsdtar -tf "$archive" 2>/dev/null | grep -iE '\.jar$')
+            fi
+            ;;
+    esac
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] && add_jar_file "$entry"
+    done < <(find "$dest" -type f -iname '*.jar' 2>/dev/null)
+}
+
+collect_system_jars() {
+    local roots=() prune=() archives=()
+    local root f lf d first=1 i=0 archive
+
+    if is_windows_shell; then
+        for root in /c /d /e /f /g /h /i /j /k /l /m /n /o /p /q /r /s /t /u /v /w /x /y /z; do
+            [ -d "$root" ] && roots+=("$root")
+        done
+        [ ${#roots[@]} -eq 0 ] && roots=("/")
+    else
+        roots=("/")
+    fi
+
+    prune=( -type d \( )
+    for d in /System /private /Applications /cores /tmp; do
+        if [ $first -eq 1 ]; then first=0; else prune+=( -o ); fi
+        prune+=( -path "$d" )
+    done
+    for d in .git .svn .hg node_modules __pycache__ .cache .gradle .m2 \
+             proc sys dev run usr lib lib32 lib64 bin sbin etc boot var nix snap \
+             libraries versions runtime jre jdk processedMods assets natives \
+             "System Volume Information" Windows "Program Files" "Program Files (x86)" \
+             ProgramData Windows.old Recovery PerfLogs; do
+        if [ $first -eq 1 ]; then first=0; else prune+=( -o ); fi
+        prune+=( -iname "$d" )
+    done
+    prune+=( \) -prune )
+
+    printf '%s   searching: %s%s\n' "$C_GRAY" "${roots[*]}" "$C_RESET"
+    for root in "${roots[@]}"; do
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+            case "$lf" in
+                *.jar) add_jar_file "$f" ;;
+                *)     archives+=("$f") ;;
+            esac
+        done < <(find "$root" \
+            -path "$TMPROOT" -prune -o \
+            "${prune[@]}" -o \
+            -type f \( -iname '*.jar' -o -iname '*.zip' -o -iname '*.mcpack' -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.tar' -o -iname '*.rar' -o -iname '*.7z' \) -print 2>/dev/null)
+    done
+
+    printf '%s   archives found: %s%s\n' "$C_GRAY" "${#archives[@]}" "$C_RESET"
+    for archive in "${archives[@]}"; do
+        i=$((i + 1))
+        extract_archive_jars "$archive" "$i"
+    done
+}
+
+collect_custom_jars() {
+    collect_mods_dir_jars "$modsPath"
+}
+
+# ---------------------------------------------------------------------------
 # Banner / input
 # ---------------------------------------------------------------------------
 clear 2>/dev/null || true
@@ -1345,64 +1632,87 @@ printf '\n'
 write_rule "━" 76 "$C_DARKCYAN"
 printf '\n'
 
-printf 'Enter path to the mods folder: '
-printf '%s(press Enter to use default)%s\n' "$C_DARKGRAY" "$C_RESET"
-printf 'PATH: '
-IFS= read -r modsPath
+printf '%sSelect scan scope:%s\n' "$C_WHITE" "$C_RESET"
+printf '  %s1)%s Whole system %s(jars + .zip/.tar.gz/.rar/.mcpack archives + recycle bin)%s\n' \
+    "$C_CYAN" "$C_RESET" "$C_DARKGRAY" "$C_RESET"
+printf '  %s2)%s Launchers only %s(PrismLauncher + Lunar + .minecraft)%s\n' \
+    "$C_CYAN" "$C_RESET" "$C_DARKGRAY" "$C_RESET"
+printf '  %s3)%s Custom folder %s(default: %s)%s\n' \
+    "$C_CYAN" "$C_RESET" "$C_DARKGRAY" "$(default_custom_path)" "$C_RESET"
+printf 'Choice %s[3]%s: ' "$C_DARKGRAY" "$C_RESET"
+IFS= read -r scanChoice
+[ -z "$scanChoice" ] && scanChoice=3
+while [ "$scanChoice" != 1 ] && [ "$scanChoice" != 2 ] && [ "$scanChoice" != 3 ]; do
+    printf '%sPlease enter 1, 2 or 3: %s' "$C_YELLOW" "$C_RESET"
+    IFS= read -r scanChoice
+    [ -z "$scanChoice" ] && scanChoice=3
+done
 printf '\n'
 
-# trim whitespace and matching quotes
-modsPath="${modsPath#"${modsPath%%[![:space:]]*}"}"
-modsPath="${modsPath%"${modsPath##*[![:space:]]}"}"
-case "$modsPath" in
-    \"*\") modsPath=${modsPath#\"}; modsPath=${modsPath%\"} ;;
-    \'*\') modsPath=${modsPath#\'}; modsPath=${modsPath%\'} ;;
+modsPath=""
+case "$scanChoice" in
+    1) scanMode="system" ;;
+    2) scanMode="launchers" ;;
+    3)
+        scanMode="custom"
+        defPath=$(default_custom_path)
+        printf 'Enter path to the mods folder: '
+        printf '%s(press Enter to use default)%s\n' "$C_DARKGRAY" "$C_RESET"
+        printf 'PATH %s[%s]%s: ' "$C_DARKGRAY" "$defPath" "$C_RESET"
+        IFS= read -r modsPath
+        printf '\n'
+
+        # trim whitespace and matching quotes
+        modsPath="${modsPath#"${modsPath%%[![:space:]]*}"}"
+        modsPath="${modsPath%"${modsPath##*[![:space:]]}"}"
+        case "$modsPath" in
+            \"*\") modsPath=${modsPath#\"}; modsPath=${modsPath%\"} ;;
+            \'*\') modsPath=${modsPath#\'}; modsPath=${modsPath%\'} ;;
+        esac
+
+        if [ -z "$modsPath" ]; then
+            modsPath=$defPath
+            printf 'Continuing with %s%s%s\n\n' "$C_WHITE" "$modsPath" "$C_RESET"
+        fi
+
+        # expand a leading ~
+        case "$modsPath" in
+            "~"|"~/"*) modsPath="$HOME${modsPath#\~}" ;;
+        esac
+
+        if [ ! -d "$modsPath" ]; then
+            printf '%s❌ Invalid Path!%s\n' "$C_RED" "$C_RESET"
+            printf '%sThe directory does not exist or is not accessible.%s\n\n' "$C_YELLOW" "$C_RESET"
+            printf '%sTried to access: %s%s\n\n' "$C_GRAY" "$modsPath" "$C_RESET"
+            printf '%sPress any key to exit...%s\n' "$C_GRAY" "$C_RESET"
+            IFS= read -r -n 1 -s
+            exit 1
+        fi
+
+        if [ ! -r "$modsPath" ] || [ ! -x "$modsPath" ]; then
+            printf '%s❌ Error accessing directory: %s%s\n' "$C_RED" "$modsPath" "$C_RESET"
+            printf '%sPress any key to exit...%s\n' "$C_GRAY" "$C_RESET"
+            IFS= read -r -n 1 -s
+            exit 1
+        fi
+        ;;
 esac
 
-if [ -z "$modsPath" ]; then
-    case "$OSTYPE" in
-        darwin*)
-            modsPath="$HOME/Library/Application Support/minecraft/mods"
-            ;;
-        msys*|cygwin*|win32*)
-            modsPath="${APPDATA:-$HOME/AppData/Roaming}/.minecraft/mods"
-            ;;
-        *)
-            modsPath=""
-            if grep -qi microsoft /proc/version 2>/dev/null && command -v cmd.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
-                __winappdata=$(cmd.exe /c echo %APPDATA% 2>/dev/null | tr -d '\r\n')
-                if [ -n "$__winappdata" ]; then
-                    modsPath="$(wslpath -u "$__winappdata" 2>/dev/null)/.minecraft/mods"
-                fi
-            fi
-            [ -z "$modsPath" ] && modsPath="$HOME/.minecraft/mods"
-            ;;
-    esac
-    printf 'Continuing with %s%s%s\n\n' "$C_WHITE" "$modsPath" "$C_RESET"
-fi
-
-# expand a leading ~
-case "$modsPath" in
-    "~"|"~/"*) modsPath="$HOME${modsPath#\~}" ;;
+case "$scanMode" in
+    system)
+        printf '%s📁 Scan scope: %s%s\n\n' "$C_GREEN" "whole system (recycle bin included)" "$C_RESET"
+        printf '%s⚠️  Whole-system scans can take a long time (archive extraction + network lookups).%s\n\n' "$C_YELLOW" "$C_RESET"
+        scanWhere="the whole system"
+        ;;
+    launchers)
+        printf '%s📁 Scan scope: %s%s\n\n' "$C_GREEN" "PrismLauncher / Lunar / .minecraft" "$C_RESET"
+        scanWhere="the launcher mod folders"
+        ;;
+    custom)
+        printf '%s📁 Scanning directory: %s%s\n\n' "$C_GREEN" "$modsPath" "$C_RESET"
+        scanWhere="$modsPath"
+        ;;
 esac
-
-if [ ! -d "$modsPath" ]; then
-    printf '%s❌ Invalid Path!%s\n' "$C_RED" "$C_RESET"
-    printf '%sThe directory does not exist or is not accessible.%s\n\n' "$C_YELLOW" "$C_RESET"
-    printf '%sTried to access: %s%s\n\n' "$C_GRAY" "$modsPath" "$C_RESET"
-    printf '%sPress any key to exit...%s\n' "$C_GRAY" "$C_RESET"
-    IFS= read -r -n 1 -s
-    exit 1
-fi
-
-if [ ! -r "$modsPath" ] || [ ! -x "$modsPath" ]; then
-    printf '%s❌ Error accessing directory: %s%s\n' "$C_RED" "$modsPath" "$C_RESET"
-    printf '%sPress any key to exit...%s\n' "$C_GRAY" "$C_RESET"
-    IFS= read -r -n 1 -s
-    exit 1
-fi
-
-printf '%s📁 Scanning directory: %s%s\n\n' "$C_GREEN" "$modsPath" "$C_RESET"
 
 # ---------------------------------------------------------------------------
 # Minecraft process uptime
@@ -1427,14 +1737,16 @@ fi
 # JAR enumeration
 # ---------------------------------------------------------------------------
 jarFiles=()
-while IFS= read -r __jar; do
-    [ -n "$__jar" ] && jarFiles+=("$__jar")
-done < <(find "$modsPath" -maxdepth 1 -type f -iname '*.jar' 2>/dev/null | LC_ALL=C sort)
+case "$scanMode" in
+    system)    collect_system_jars ;;
+    launchers) collect_launcher_jars ;;
+    custom)    collect_custom_jars ;;
+esac
 
 totalFiles=${#jarFiles[@]}
 
 if [ "$totalFiles" -eq 0 ]; then
-    printf '%s⚠️  No JAR files found in: %s%s\n' "$C_YELLOW" "$modsPath" "$C_RESET"
+    printf '%s⚠️  No JAR files found in: %s%s\n' "$C_YELLOW" "$scanWhere" "$C_RESET"
     printf '%sPress any key to exit...%s\n' "$C_GRAY" "$C_RESET"
     IFS= read -r -n 1 -s
     exit 0
