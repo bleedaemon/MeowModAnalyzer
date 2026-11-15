@@ -1726,50 +1726,58 @@ function Invoke-ParallelPass {
         if ($Whitelist -and $Whitelist.Contains($jar.Name)) { continue }
 
         $scriptBlock = {
-            param($FilePath, $ScanMode, $Pats, $Strs, $Fws, $ChStrs)
+            param($FilePath, $ScanMode, $Pats, $PatOpts, $Fws, $FwOpts, $ChStrs, $ModScanCode, $BypassCode, $ObfCode)
 
             Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-            $script:patternRegex = [regex]::new($Pats, [System.Text.RegularExpressions.RegexOptions]::Compiled)
-            $script:fullwidthRegex = [regex]::new($Fws, [System.Text.RegularExpressions.RegexOptions]::Compiled)
-            $script:cheatStrings = $ChStrs
+            # Восстанавливаем те же самые регулярные выражения и хэш-сеты, что и в основном потоке
+            $script:patternRegex   = [regex]::new($Pats, [System.Text.RegularExpressions.RegexOptions]$PatOpts)
+            $script:fullwidthRegex = [regex]::new($Fws, [System.Text.RegularExpressions.RegexOptions]$FwOpts)
+            $script:cheatStrings   = $ChStrs
             $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
             foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
 
-            # Переносим функции внутрь воркера прямо здесь, чтобы они выполнялись в контексте сессии
-            function Invoke-ModScan { ... } # (или вызываем оригинальные)
+            # Динамически внедряем оригинальные тела функций в контекст воркера
+            . ([scriptblock]::Create($ModScanCode))
+            . ([scriptblock]::Create($BypassCode))
+            . ([scriptblock]::Create($ObfCode))
 
             $payload = @{ Patterns = @(); Strings = @(); Fullwidth = @(); Flags = @() }
             try {
                 switch ($ScanMode) {
                     '2' {
                         $r = Invoke-ModScan -FilePath $FilePath
-                        $payload.Patterns = @($r.Patterns)
-                        $payload.Strings = @($r.Strings)
+                        $payload.Patterns  = @($r.Patterns)
+                        $payload.Strings   = @($r.Strings)
                         $payload.Fullwidth = @($r.Fullwidth)
                     }
-                    '3' { $payload.Flags = @(Invoke-BypassScan -FilePath $FilePath) }
-                    '4' { $payload.Flags = @(Invoke-ObfuscationScan -FilePath $FilePath) }
+                    '3' {
+                        $payload.Flags = @(Invoke-BypassScan -FilePath $FilePath)
+                    }
+                    '4' {
+                        $payload.Flags = @(Invoke-ObfuscationScan -FilePath $FilePath)
+                    }
                 }
             } catch { }
             return [PSCustomObject]$payload
         }
-    }
 
         $powershell = [System.Management.Automation.PowerShell]::Create().AddScript($scriptBlock)
         [void]$powershell.AddArgument($jar.FullName)
         [void]$powershell.AddArgument($Mode)
         [void]$powershell.AddArgument($patternRegex.ToString())
+        [void]$powershell.AddArgument([int]$patternRegex.Options)
         [void]$powershell.AddArgument($fullwidthRegex.ToString())
-        [void]$powershell.AddArgument($cheatStrings)
+        [void]$powershell.AddArgument([int]$fullwidthRegex.Options)
+        [void]$powershell.AddArgument($script:cheatStrings)
+        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
         [void]$powershell.AddArgument((Get-Command Invoke-BypassScan).Definition)
         [void]$powershell.AddArgument((Get-Command Invoke-ObfuscationScan).Definition)
-        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
 
         $powershell.RunspacePool = $runspacePool
         $jobs.Add([PSCustomObject]@{
-            Index = $i
-            PowerShell = $powershell
+            Index       = $i
+            PowerShell  = $powershell
             AsyncResult = $powershell.BeginInvoke()
         })
     }
