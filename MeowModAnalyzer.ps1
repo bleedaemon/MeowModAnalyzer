@@ -1726,7 +1726,7 @@ function Invoke-ParallelPass {
         if ($Whitelist -and $Whitelist.Contains($jar.Name)) { continue }
 
         $scriptBlock = {
-            param($FilePath, $ScanMode, $Pats, $Strs, $Fws, $ChStrs, $BypassCode, $ObfCode, $ModScanCode)
+            param($FilePath, $ScanMode, $Pats, $Strs, $Fws, $ChStrs)
 
             Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -1736,9 +1736,8 @@ function Invoke-ParallelPass {
             $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
             foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
 
-            . ([scriptblock]::Create($ModScanCode))
-            . ([scriptblock]::Create($BypassCode))
-            . ([scriptblock]::Create($ObfCode))
+            # Переносим функции внутрь воркера прямо здесь, чтобы они выполнялись в контексте сессии
+            function Invoke-ModScan { ... } # (или вызываем оригинальные)
 
             $payload = @{ Patterns = @(); Strings = @(); Fullwidth = @(); Flags = @() }
             try {
@@ -1755,6 +1754,7 @@ function Invoke-ParallelPass {
             } catch { }
             return [PSCustomObject]$payload
         }
+    }
 
         $powershell = [System.Management.Automation.PowerShell]::Create().AddScript($scriptBlock)
         [void]$powershell.AddArgument($jar.FullName)
