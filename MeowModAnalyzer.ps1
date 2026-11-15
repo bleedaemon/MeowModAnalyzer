@@ -1306,7 +1306,22 @@ function Invoke-JvmScan {
 # ---------------------------------------------------------------------------
 # Worker mode (passes 2-4 run inside Start-Job child processes)
 # ---------------------------------------------------------------------------
-if ($WorkerMode) {
+function Write-WorkerStatus {
+    param([string]$Path, [string]$Text)
+    try {
+        $tmp = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Invoke-WorkerItems {
+    param(
+        [string]$WorkerMode,
+        [string]$WorkerList,
+        [string]$WorkerOut
+    )
+
     $items = @()
     try {
         if ($WorkerList -and (Test-Path -LiteralPath $WorkerList)) {
@@ -1314,15 +1329,6 @@ if ($WorkerMode) {
             $items = @($listText | ConvertFrom-Json)
         }
     } catch { }
-
-    function Write-WorkerStatus {
-        param([string]$Path, [string]$Text)
-        try {
-            $tmp = "$Path.tmp"
-            [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
-            Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction SilentlyContinue
-        } catch { }
-    }
 
     $statusFile = Join-Path $WorkerOut "status.txt"
     $countFile  = Join-Path $WorkerOut "count.txt"
@@ -1374,6 +1380,10 @@ if ($WorkerMode) {
     }
 
     Write-WorkerStatus $statusFile "done"
+}
+
+if ($WorkerMode) {
+    Invoke-WorkerItems -WorkerMode $WorkerMode -WorkerList $WorkerList -WorkerOut $WorkerOut
     exit 0
 }
 
@@ -1650,6 +1660,45 @@ function Get-WhitelistedNames {
     return ,$set
 }
 
+# When this script was launched through Invoke-Expression / Invoke-RestMethod there
+# is no $PSCommandPath to re-execute for Start-Job -FilePath. In that case the
+# worker is built from the functions and lookup tables already loaded in memory.
+function Get-ParallelWorkerPayload {
+    $names = @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')
+    $defs = @{}
+    foreach ($name in $names) {
+        $cmd = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
+        if (-not $cmd) { return $null }
+        $defs[$name] = "function $name {`n$($cmd.Definition)`n}"
+    }
+    return @{
+        Functions        = $defs
+        Patterns         = $patternRegex.ToString()
+        PatternOptions   = [int]$patternRegex.Options
+        Fullwidth        = $fullwidthRegex.ToString()
+        FullwidthOptions = [int]$fullwidthRegex.Options
+        CheatStrings     = @($script:cheatStrings)
+    }
+}
+
+$script:ParallelWorkerBlock = {
+    param($WorkerMode, $WorkerList, $WorkerOut, $Payload)
+
+    foreach ($name in @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')) {
+        if ($Payload.Functions -and $Payload.Functions.ContainsKey($name)) {
+            . ([scriptblock]::Create([string]$Payload.Functions[$name]))
+        }
+    }
+
+    $patternRegex = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
+    $fullwidthRegex = [regex]::new([string]$Payload.Fullwidth, [System.Text.RegularExpressions.RegexOptions]$Payload.FullwidthOptions)
+    $script:cheatStrings = @($Payload.CheatStrings)
+    $cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($s in $script:cheatStrings) { [void]$cheatStringSet.Add($s) }
+
+    Invoke-WorkerItems -WorkerMode $WorkerMode -WorkerList $WorkerList -WorkerOut $WorkerOut
+}
+
 function Invoke-ParallelPass {
     param(
         [string]$Mode,
@@ -1658,12 +1707,18 @@ function Invoke-ParallelPass {
     )
 
     if (-not $script:ArchiveTemp) { return $null }
-    if (-not $PSCommandPath) {
-        Write-Host "   ⚠️  Cannot locate this script for parallel workers — using a single thread" -ForegroundColor DarkYellow
-        return $null
-    }
     $count = $jarFiles.Count
     if ($count -lt 2 -or $threads -lt 2) { return $null }
+
+    $useFileWorker = -not [string]::IsNullOrWhiteSpace($PSCommandPath)
+    $workerPayload = $null
+    if (-not $useFileWorker) {
+        $workerPayload = Get-ParallelWorkerPayload
+        if ($null -eq $workerPayload) {
+            Write-Host "   ⚠️  Could not prepare parallel workers — using a single thread" -ForegroundColor DarkYellow
+            return $null
+        }
+    }
 
     $root = Join-Path $script:ArchiveTemp ("parallel-" + $Mode)
     if (Test-Path -LiteralPath $root) {
@@ -1703,7 +1758,11 @@ function Invoke-ParallelPass {
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
         try {
-            $job = Start-Job -FilePath $PSCommandPath -ArgumentList $Mode, $listPath, $outDir
+            if ($useFileWorker) {
+                $job = Start-Job -FilePath $PSCommandPath -ArgumentList $Mode, $listPath, $outDir
+            } else {
+                $job = Start-Job -ScriptBlock $script:ParallelWorkerBlock -ArgumentList $Mode, $listPath, $outDir, $workerPayload
+            }
         } catch {
             foreach ($j in $jobs) {
                 try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
@@ -1782,7 +1841,7 @@ function Invoke-ParallelPass {
     }
 
     $threadWord = if ($threads -eq 1) { "thread" } else { "threads" }
-    Write-Host "   ✓ $Label`: $count/$count mods scanned" -ForegroundColor DarkGray
+    Write-Host "   ✓ $Label`: $count/$count mods scanned with $threads $threadWord" -ForegroundColor DarkGray
     return $results
 }
 
