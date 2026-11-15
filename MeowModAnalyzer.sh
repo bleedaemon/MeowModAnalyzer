@@ -86,6 +86,7 @@ TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/meowmodanalyzer.XXXXXX") || {
     exit 1
 }
 cleanup() {
+    if [ -t 1 ]; then printf '\033[?25h' 2>/dev/null; fi
     [ -n "$TMPROOT" ] && rm -rf "$TMPROOT" 2>/dev/null
 }
 trap cleanup EXIT
@@ -1718,6 +1719,35 @@ case "$scanMode" in
 esac
 
 # ---------------------------------------------------------------------------
+# Scan threads
+# ---------------------------------------------------------------------------
+defaultThreads=1
+case "$scanMode" in
+    system|launchers) defaultThreads=4 ;;
+esac
+threads=$defaultThreads
+while :; do
+    printf 'Threads for scanning %s(1-64) [%s]%s: ' "$C_DARKGRAY" "$defaultThreads" "$C_RESET"
+    if ! IFS= read -r threadInput; then
+        printf '\n'
+        break
+    fi
+    [ -z "$threadInput" ] && break
+    case "$threadInput" in
+        *[!0-9]*)
+            printf '%sPlease enter a number between 1 and 64.%s\n' "$C_YELLOW" "$C_RESET"
+            continue
+            ;;
+    esac
+    if [ "$threadInput" -ge 1 ] && [ "$threadInput" -le 64 ]; then
+        threads=$threadInput
+        break
+    fi
+    printf '%sPlease enter a number between 1 and 64.%s\n' "$C_YELLOW" "$C_RESET"
+done
+printf '\n'
+
+# ---------------------------------------------------------------------------
 # Minecraft process uptime
 # ---------------------------------------------------------------------------
 JAVA_PID=$(find_java_pid)
@@ -2335,100 +2365,260 @@ if [ "$dedupeHashes" = true ]; then
     fi
 fi
 
+SCAN_WORK="$TMPROOT/work"
+PAR_WORK="$TMPROOT/parallel"
+
+parallel_enabled() { [ "$threads" -gt 1 ] && [ "$totalFiles" -gt 1 ]; }
+
+scan_one_index() { # pass index workdir
+    local pass=$1 i=$2 work=$3 jar filename
+    jar=${jarFiles[i]}
+    filename=${jar##*/}
+    rm -rf "$work"
+    mkdir -p "$work" 2>/dev/null || return 0
+    case "$pass" in
+        2)
+            is_modrinth_whitelisted "$filename" && return 0
+            deep_scan "$jar" "$work"
+            ;;
+        3)
+            is_modrinth_whitelisted "$filename" && return 0
+            bypass_scan "$jar" "$work"
+            ;;
+        4)
+            obf_scan "$jar" "$work"
+            ;;
+    esac
+}
+
+scan_set_status() { # file text
+    local f=$1 text=$2 tmp="$1.tmp.$$"
+    printf '%s\n' "$text" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+    return 0
+}
+
+scan_trunc() { # string maxlen
+    local s=$1 max=$2
+    if [ "$max" -lt 2 ]; then
+        printf '%s' "$s"
+    elif [ "${#s}" -gt "$max" ]; then
+        printf '%s…' "${s:0:$((max - 1))}"
+    else
+        printf '%s' "$s"
+    fi
+}
+
+scan_chunk() { # pass start end marker status finished
+    local pass=$1 start=$2 end=$3 marker=$4 status=$5 finished=$6 i jar filename
+    for ((i = start; i < end; i++)); do
+        jar=${jarFiles[i]}
+        filename=${jar##*/}
+        scan_set_status "$status" "$i"$'\t'"$filename"
+        scan_one_index "$pass" "$i" "$PAR_WORK/$pass/$i"
+        printf '%s\n' "$i" >> "$finished" 2>/dev/null || true
+    done
+    scan_set_status "$status" "done"
+    : > "$marker" 2>/dev/null || true
+}
+
+run_pass_parallel() { # pass label
+    local pass=$1 label=$2 chunkCount base rem c size start end launched=0 doneCount=0 counted frame=0 f
+    local root="$PAR_WORK/$pass"
+    local total=0 panel=0 cols maxw status line
+    rm -rf "$root"
+    mkdir -p "$root" 2>/dev/null || return 0
+    : > "$root/.finished"
+    chunkCount=$threads
+    [ "$chunkCount" -gt "$totalFiles" ] && chunkCount=$totalFiles
+    base=$((totalFiles / chunkCount))
+    rem=$((totalFiles % chunkCount))
+    start=0
+    for ((c = 0; c < chunkCount; c++)); do
+        size=$base
+        [ "$c" -lt "$rem" ] && size=$((size + 1))
+        [ "$size" -lt 1 ] && continue
+        end=$((start + size))
+        scan_chunk "$pass" "$start" "$end" "$root/.done.$c" "$root/.status.$c" "$root/.finished" &
+        launched=$((launched + 1))
+        start=$end
+    done
+
+    if [ -t 1 ]; then
+        cols=$(tput cols 2>/dev/null)
+        case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
+        maxw=$((cols - 8))
+        [ "$maxw" -lt 20 ] && maxw=20
+        printf '\033[?25l'
+        while [ "$launched" -gt 0 ]; do
+            doneCount=0
+            for f in "$root"/.done.*; do
+                [ -e "$f" ] && doneCount=$((doneCount + 1))
+            done
+            [ "$doneCount" -ge "$launched" ] && break
+
+            total=$(wc -l < "$root/.finished" 2>/dev/null | tr -d ' \t')
+            case "$total" in ''|*[!0-9]*) total=0 ;; esac
+            [ "$panel" -gt 0 ] && printf '\033[%dA\033[J' "$panel"
+            frame=$(((frame + 1) % ${#spinnerFrames[@]}))
+            printf '%s%s [%s] %s — %s/%s mods scanned%s\n' \
+                "$C_YELLOW" "${spinnerFrames[frame]}" "$label" "$threads" "$total" "$totalFiles" "$C_RESET"
+            panel=1
+            for ((f = 0; f < launched; f++)); do
+                status=$(cat "$root/.status.$f" 2>/dev/null)
+                if [ -z "$status" ]; then
+                    line="starting…"
+                elif [ "$status" = "done" ]; then
+                    line="✓ finished"
+                else
+                    line="scanning ${status#*$'\t'}"
+                fi
+                printf '%s  T%s%s %s\n' "$C_DARKGRAY" "$((f + 1))" "$C_RESET" "$(scan_trunc "$line" "$maxw")"
+                panel=$((panel + 1))
+            done
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        [ "$panel" -gt 0 ] && printf '\033[%dA\033[J' "$panel"
+        printf '\033[?25h'
+    else
+        while [ "$launched" -gt 0 ]; do
+            doneCount=0
+            for f in "$root"/.done.*; do
+                [ -e "$f" ] && doneCount=$((doneCount + 1))
+            done
+            [ "$doneCount" -ge "$launched" ] && break
+            total=$(wc -l < "$root/.finished" 2>/dev/null | tr -d ' \t')
+            case "$total" in ''|*[!0-9]*) total=0 ;; esac
+            frame=$(((frame + 1) % ${#spinnerFrames[@]}))
+            printf '\r%s[%s] %s — %s/%s mods scanned%s' \
+                "$C_YELLOW" "${spinnerFrames[frame]}" "$label" "$total" "$totalFiles" "$C_RESET"
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+        printf '\r%*s\r' 100 ''
+    fi
+
+    wait
+    counted=$(wc -l < "$root/.finished" 2>/dev/null | tr -d ' \t')
+    case "$counted" in ''|*[!0-9]*) counted=0 ;; esac
+    printf '%s   ✓ %s: %s/%s mods scanned\n' \
+        "$C_DARKGRAY" "$label" "$counted" "$totalFiles" "$threads" \
+        "$([ "$threads" -eq 1 ] && printf '' || printf 's')" "$C_RESET"
+}
+
+collect_pass2() { # index workdir
+    local i=$1 work=$2 filename
+    filename=${jarFiles[i]##*/}
+    if [ -s "$work/pats" ] || [ -s "$work/strs" ] || [ -s "$work/fwres" ]; then
+        suspFiles+=("$filename")
+        suspPatterns+=("$(cat "$work/pats" 2>/dev/null)")
+        suspStrings+=("$(cat "$work/strs" 2>/dev/null)")
+        suspFullwidth+=("$(cat "$work/fwres" 2>/dev/null)")
+        suspPaths+=("${jarFiles[i]}")
+        remove_verified "$filename"
+    fi
+}
+
+collect_pass3() { # index workdir
+    local i=$1 work=$2 filename
+    filename=${jarFiles[i]##*/}
+    if [ -s "$work/flags" ]; then
+        bypassFiles+=("$filename")
+        bypassFlags+=("$(cat "$work/flags" 2>/dev/null)")
+        bypassPaths+=("${jarFiles[i]}")
+        remove_verified "$filename"
+        remove_unknown "$filename"
+    fi
+}
+
+collect_pass4() { # index workdir
+    local i=$1 work=$2 filename alreadyFlagged
+    filename=${jarFiles[i]##*/}
+    if [ -s "$work/flags" ]; then
+        alreadyFlagged="false"
+        in_list "$filename" "${suspFiles[@]}" && alreadyFlagged="true"
+        in_list "$filename" "${bypassFiles[@]}" && alreadyFlagged="true"
+        if [ "$alreadyFlagged" = "false" ]; then
+            obfFiles+=("$filename")
+            obfFlags+=("$(cat "$work/flags" 2>/dev/null)")
+            obfPaths+=("${jarFiles[i]}")
+            remove_verified "$filename"
+        fi
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # PASS 2 — deep scan
 # ---------------------------------------------------------------------------
 printf '%s🔬 Pass 2 — Deep-scanning all %s %s...%s\n' "$C_CYAN" "$totalFiles" "$modWord" "$C_RESET"
 
-SCAN_WORK="$TMPROOT/work"
-idx=0
-for jar in "${jarFiles[@]}"; do
-    idx=$((idx + 1))
-    filename=$(basename "$jar")
-    spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
-    printf '\r%s[%s] Scanning: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
-
-    if is_modrinth_whitelisted "$filename"; then
-        continue
-    fi
-
-    rm -rf "$SCAN_WORK"
-    mkdir -p "$SCAN_WORK"
-
-    deep_scan "$jar" "$SCAN_WORK"
-
-    if [ -s "$SCAN_WORK/pats" ] || [ -s "$SCAN_WORK/strs" ] || [ -s "$SCAN_WORK/fwres" ]; then
-        suspFiles+=("$filename")
-        suspPatterns+=("$(cat "$SCAN_WORK/pats" 2>/dev/null)")
-        suspStrings+=("$(cat "$SCAN_WORK/strs" 2>/dev/null)")
-        suspFullwidth+=("$(cat "$SCAN_WORK/fwres" 2>/dev/null)")
-        suspPaths+=("$jar")
-        remove_verified "$filename"
-    fi
-done
-printf '\r%*s\r' 100 ''
+if parallel_enabled; then
+    printf '%s   Using %s threads%s\n' "$C_DARKGRAY" "$threads" "$C_RESET"
+    run_pass_parallel 2 "Scanning"
+    for ((i = 0; i < totalFiles; i++)); do
+        collect_pass2 "$i" "$PAR_WORK/2/$i"
+    done
+else
+    idx=0
+    for jar in "${jarFiles[@]}"; do
+        i=$idx
+        idx=$((idx + 1))
+        filename=${jar##*/}
+        spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
+        printf '\r%s[%s] Scanning: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
+        scan_one_index 2 "$i" "$SCAN_WORK"
+        collect_pass2 "$i" "$SCAN_WORK"
+    done
+    printf '\r%*s\r' 100 ''
+fi
 
 # ---------------------------------------------------------------------------
 # PASS 3 — bypass / injection
 # ---------------------------------------------------------------------------
 printf '%s🛡️  Pass 3 — Bypass/injection scan on all %s %s...%s\n' "$C_MAGENTA" "$totalFiles" "$modWord" "$C_RESET"
 
-idx=0
-for jar in "${jarFiles[@]}"; do
-    idx=$((idx + 1))
-    filename=$(basename "$jar")
-    spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
-    printf '\r%s[%s] Bypass scan: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
-
-    if is_modrinth_whitelisted "$filename"; then
-        continue
-    fi
-
-    rm -rf "$SCAN_WORK"
-    mkdir -p "$SCAN_WORK"
-
-    bypass_scan "$jar" "$SCAN_WORK"
-
-    if [ -s "$SCAN_WORK/flags" ]; then
-        bypassFiles+=("$filename")
-        bypassFlags+=("$(cat "$SCAN_WORK/flags" 2>/dev/null)")
-        bypassPaths+=("$jar")
-        remove_verified "$filename"
-        remove_unknown "$filename"
-    fi
-done
-printf '\r%*s\r' 100 ''
+if parallel_enabled; then
+    printf '%s   Using %s threads%s\n' "$C_DARKGRAY" "$threads" "$C_RESET"
+    run_pass_parallel 3 "Bypass scan"
+    for ((i = 0; i < totalFiles; i++)); do
+        collect_pass3 "$i" "$PAR_WORK/3/$i"
+    done
+else
+    idx=0
+    for jar in "${jarFiles[@]}"; do
+        i=$idx
+        idx=$((idx + 1))
+        filename=${jar##*/}
+        spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
+        printf '\r%s[%s] Bypass scan: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
+        scan_one_index 3 "$i" "$SCAN_WORK"
+        collect_pass3 "$i" "$SCAN_WORK"
+    done
+    printf '\r%*s\r' 100 ''
+fi
 
 # ---------------------------------------------------------------------------
 # PASS 4 — obfuscation
 # ---------------------------------------------------------------------------
 printf '%s🔎 Pass 4 — Obfuscation analysis on all %s %s...%s\n' "$C_DARKCYAN" "$totalFiles" "$modWord" "$C_RESET"
 
-idx=0
-for jar in "${jarFiles[@]}"; do
-    idx=$((idx + 1))
-    filename=$(basename "$jar")
-    spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
-    printf '\r%s[%s] Obf scan: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
-
-    rm -rf "$SCAN_WORK"
-    mkdir -p "$SCAN_WORK"
-
-    obf_scan "$jar" "$SCAN_WORK"
-
-    if [ -s "$SCAN_WORK/flags" ]; then
-        alreadyFlagged="false"
-        in_list "$filename" "${suspFiles[@]}" && alreadyFlagged="true"
-        in_list "$filename" "${bypassFiles[@]}" && alreadyFlagged="true"
-        if [ "$alreadyFlagged" = "false" ]; then
-            obfFiles+=("$filename")
-            obfFlags+=("$(cat "$SCAN_WORK/flags" 2>/dev/null)")
-            obfPaths+=("$jar")
-            remove_verified "$filename"
-        fi
-    fi
-done
-printf '\r%*s\r' 100 ''
+if parallel_enabled; then
+    printf '%s   Using %s threads%s\n' "$C_DARKGRAY" "$threads" "$C_RESET"
+    run_pass_parallel 4 "Obf scan"
+    for ((i = 0; i < totalFiles; i++)); do
+        collect_pass4 "$i" "$PAR_WORK/4/$i"
+    done
+else
+    idx=0
+    for jar in "${jarFiles[@]}"; do
+        i=$idx
+        idx=$((idx + 1))
+        filename=${jar##*/}
+        spinner="${spinnerFrames[$((idx % ${#spinnerFrames[@]}))]}"
+        printf '\r%s[%s] Obf scan: %s/%s - %s%s' "$C_YELLOW" "$spinner" "$idx" "$totalFiles" "$filename" "$C_RESET"
+        scan_one_index 4 "$i" "$SCAN_WORK"
+        collect_pass4 "$i" "$SCAN_WORK"
+    done
+    printf '\r%*s\r' 100 ''
+fi
 
 # ---------------------------------------------------------------------------
 # PASS 5 — JVM

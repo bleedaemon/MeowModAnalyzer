@@ -1,6 +1,15 @@
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+param(
+    [string]$WorkerMode = '',
+    [string]$WorkerList = '',
+    [string]$WorkerOut  = ''
+)
+
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding           = [System.Text.Encoding]::UTF8
+
+# Workers run this same file with -WorkerMode; skip all of the interactive UI.
+if (-not $WorkerMode) {
 chcp 65001 | Out-Null
 Clear-Host
 
@@ -42,6 +51,7 @@ Write-Host "MeowTonynoh" -ForegroundColor Cyan
 Write-Host ""
 Write-Host ("━" * 76) -ForegroundColor DarkCyan
 Write-Host
+}
 
 # ---------------------------------------------------------------------------
 # Scan-scope helpers
@@ -54,8 +64,11 @@ $script:SkipDirNames = @(
     'ProgramData','Windows.old','Recovery','PerfLogs'
 )
 
-$script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
+$script:ArchiveTemp = $null
+if (-not $WorkerMode) {
+    $script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
+}
 $script:JarOrigin = @{}
 $script:HashPrimary = @{}
 $script:PathDupes = @{}
@@ -364,6 +377,7 @@ function Add-SystemJars {
     }
 }
 
+if (-not $WorkerMode) {
 Write-Host "Select scan scope:" -ForegroundColor White
 Write-Host "  1) " -ForegroundColor Cyan -NoNewline
 Write-Host "Whole system (jars + .zip/.tar.gz/.rar/.mcpack archives + recycle bin)" -ForegroundColor DarkGray
@@ -436,6 +450,25 @@ switch ($scanMode) {
 }
 Write-Host
 
+# ---------------------------------------------------------------------------
+# Scan threads
+# ---------------------------------------------------------------------------
+$defaultThreads = if ($scanMode -eq 'custom') { 1 } else { 4 }
+$threads = $defaultThreads
+while ($true) {
+    Write-Host "Threads for scanning" -ForegroundColor DarkGray -NoNewline
+    Write-Host "(1-64) [$defaultThreads]: " -ForegroundColor DarkGray -NoNewline
+    $threadInput = Read-Host
+    if ([string]::IsNullOrWhiteSpace($threadInput)) { break }
+    $parsedThreads = 0
+    if ([int]::TryParse($threadInput.Trim(), [ref]$parsedThreads) -and $parsedThreads -ge 1 -and $parsedThreads -le 64) {
+        $threads = $parsedThreads
+        break
+    }
+    Write-Host "Please enter a number between 1 and 64." -ForegroundColor Yellow
+}
+Write-Host
+
 $mcProcess = Get-Process javaw -ErrorAction SilentlyContinue
 if (-not $mcProcess) {
     $mcProcess = Get-Process java -ErrorAction SilentlyContinue
@@ -450,6 +483,7 @@ if ($mcProcess) {
         Write-Host "   Running for: $($uptime.Hours)h $($uptime.Minutes)m $($uptime.Seconds)s" -ForegroundColor Gray
         Write-Host ""
     } catch { }
+}
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1269,6 +1303,80 @@ function Invoke-JvmScan {
     return $results
 }
 
+# ---------------------------------------------------------------------------
+# Worker mode (passes 2-4 run inside Start-Job child processes)
+# ---------------------------------------------------------------------------
+if ($WorkerMode) {
+    $items = @()
+    try {
+        if ($WorkerList -and (Test-Path -LiteralPath $WorkerList)) {
+            $listText = [System.IO.File]::ReadAllText($WorkerList, [System.Text.Encoding]::UTF8)
+            $items = @($listText | ConvertFrom-Json)
+        }
+    } catch { }
+
+    function Write-WorkerStatus {
+        param([string]$Path, [string]$Text)
+        try {
+            $tmp = "$Path.tmp"
+            [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction SilentlyContinue
+        } catch { }
+    }
+
+    $statusFile = Join-Path $WorkerOut "status.txt"
+    $countFile  = Join-Path $WorkerOut "count.txt"
+    $completed  = 0
+
+    foreach ($item in $items) {
+        $idx  = [int]$item.Index
+        $path = [string]$item.Path
+        $outFile = Join-Path $WorkerOut ("r{0}.json" -f $idx)
+
+        Write-WorkerStatus $statusFile ([System.IO.Path]::GetFileName($path))
+
+        $payload = @{
+            Index     = $idx
+            Patterns  = @()
+            Strings   = @()
+            Fullwidth = @()
+            Flags     = @()
+        }
+
+        try {
+            switch ($WorkerMode) {
+                '2' {
+                    if (-not ($item.White -eq $true)) {
+                        $r = Invoke-ModScan -FilePath $path
+                        $payload.Patterns  = @($r.Patterns)
+                        $payload.Strings   = @($r.Strings)
+                        $payload.Fullwidth = @($r.Fullwidth)
+                    }
+                }
+                '3' {
+                    if (-not ($item.White -eq $true)) {
+                        $payload.Flags = @(Invoke-BypassScan -FilePath $path)
+                    }
+                }
+                '4' {
+                    $payload.Flags = @(Invoke-ObfuscationScan -FilePath $path)
+                }
+            }
+        } catch { }
+
+        try {
+            $json = $payload | ConvertTo-Json -Compress -Depth 6
+            [System.IO.File]::WriteAllText($outFile, $json, [System.Text.UTF8Encoding]::new($false))
+        } catch { }
+
+        $completed++
+        Write-WorkerStatus $countFile ([string]$completed)
+    }
+
+    Write-WorkerStatus $statusFile "done"
+    exit 0
+}
+
 function Write-Rule {
     param([string]$Char = "─", [int]$Width = 76, [ConsoleColor]$Color = "DarkGray")
     Write-Host ($Char * $Width) -ForegroundColor $Color
@@ -1531,20 +1639,191 @@ if ($script:DuplicateJars.Count -gt 0) {
     Write-Host "   ↺ Merged $($script:DuplicateCount) $dupWord with identical SHA-1" -ForegroundColor DarkGray
 }
 
+# ---------------------------------------------------------------------------
+# Parallel scan support (passes 2-4)
+# ---------------------------------------------------------------------------
+function Get-WhitelistedNames {
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in $verifiedMods) {
+        if ($m.ModrinthWhitelisted -eq $true) { [void]$set.Add($m.FileName) }
+    }
+    return ,$set
+}
+
+function Invoke-ParallelPass {
+    param(
+        [string]$Mode,
+        [string]$Label,
+        $Whitelist
+    )
+
+    if (-not $script:ArchiveTemp) { return $null }
+    if (-not $PSCommandPath) {
+        Write-Host "   ⚠️  Cannot locate this script for parallel workers — using a single thread" -ForegroundColor DarkYellow
+        return $null
+    }
+    $count = $jarFiles.Count
+    if ($count -lt 2 -or $threads -lt 2) { return $null }
+
+    $root = Join-Path $script:ArchiveTemp ("parallel-" + $Mode)
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+    $chunkCount = [Math]::Min($threads, $count)
+    $baseSize = [int][Math]::Floor($count / [double]$chunkCount)
+    $remainder = $count % $chunkCount
+
+    $jobs = @()
+    $start = 0
+    for ($c = 0; $c -lt $chunkCount; $c++) {
+        $size = $baseSize
+        if ($c -lt $remainder) { $size++ }
+        if ($size -lt 1) { continue }
+        $end = $start + $size
+
+        $chunkItems = @()
+        for ($i = $start; $i -lt $end; $i++) {
+            $jar = $jarFiles[$i]
+            $isWhite = $false
+            if ($Whitelist -and $Whitelist.Contains($jar.Name)) { $isWhite = $true }
+            $chunkItems += [PSCustomObject]@{
+                Index = $i
+                Path  = $jar.FullName
+                White = $isWhite
+            }
+        }
+
+        $listPath = Join-Path $root ("chunk-{0}.json" -f $c)
+        $chunkJson = ConvertTo-Json -InputObject @($chunkItems) -Compress -Depth 4
+        [System.IO.File]::WriteAllText($listPath, $chunkJson, [System.Text.UTF8Encoding]::new($false))
+
+        $outDir = Join-Path $root ("out-{0}" -f $c)
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+        try {
+            $job = Start-Job -FilePath $PSCommandPath -ArgumentList $Mode, $listPath, $outDir
+        } catch {
+            foreach ($j in $jobs) {
+                try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
+            }
+            Write-Host "   ⚠️  Could not start parallel workers — falling back to a single thread" -ForegroundColor DarkYellow
+            return $null
+        }
+        $jobs += [PSCustomObject]@{ Job = $job; OutDir = $outDir; Start = $start; End = $end }
+        $start = $end
+    }
+
+    if ($jobs.Count -eq 0) { return $null }
+
+    try {
+        while ($true) {
+            $active = @($jobs | Where-Object { @('Completed','Failed','Stopped') -notcontains $_.Job.State })
+            if ($active.Count -eq 0) { break }
+
+            $completed = 0
+            $ops = @()
+            for ($c = 0; $c -lt $jobs.Count; $c++) {
+                $j = $jobs[$c]
+
+                $countFile = Join-Path $j.OutDir "count.txt"
+                if (Test-Path -LiteralPath $countFile) {
+                    try {
+                        $n = 0
+                        if ([int]::TryParse([System.IO.File]::ReadAllText($countFile, [System.Text.Encoding]::UTF8).Trim(), [ref]$n)) {
+                            $completed += $n
+                        }
+                    } catch { }
+                }
+
+                $statusFile = Join-Path $j.OutDir "status.txt"
+                $current = ""
+                if (Test-Path -LiteralPath $statusFile) {
+                    try { $current = [System.IO.File]::ReadAllText($statusFile, [System.Text.Encoding]::UTF8).Trim() } catch { }
+                }
+                if ($current -eq "done") { $current = "✓ finished" }
+                elseif ([string]::IsNullOrWhiteSpace($current)) { $current = "starting…" }
+                else { $current = "scanning $current" }
+                $ops += ("T{0}: {1}" -f ($c + 1), $current)
+            }
+
+            $percent = 0
+            if ($count -gt 0) {
+                $percent = [int][Math]::Floor(100.0 * $completed / $count)
+                if ($percent -gt 100) { $percent = 100 }
+            }
+            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" `
+                -PercentComplete $percent -CurrentOperation ($ops -join "  |  ")
+            Start-Sleep -Milliseconds 150
+        }
+    } finally {
+        Write-Progress -Activity "$Label ($threads threads)" -Completed
+    }
+
+    $results = @{}
+    $missing = 0
+    foreach ($j in $jobs) {
+        try { Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null } catch { }
+        try { Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
+        for ($i = $j.Start; $i -lt $j.End; $i++) {
+            $file = Join-Path $j.OutDir ("r{0}.json" -f $i)
+            if (-not (Test-Path -LiteralPath $file)) { $missing++; continue }
+            try {
+                $text = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+                $results[$i] = $text | ConvertFrom-Json
+            } catch { $missing++ }
+        }
+    }
+
+    if ($missing -gt 0) {
+        Write-Host "   ⚠️  Parallel scan incomplete ($missing result(s) missing) — falling back to a single thread" -ForegroundColor DarkYellow
+        return $null
+    }
+
+    $threadWord = if ($threads -eq 1) { "thread" } else { "threads" }
+    Write-Host "   ✓ $Label`: $count/$count mods scanned" -ForegroundColor DarkGray
+    return $results
+}
+
 $modWord = if ($totalFiles -eq 1) { "mod" } else { "mods" }
 Write-Host "🔬 Pass 2 — Deep-scanning all $totalFiles $modWord..." -ForegroundColor Cyan
-$idx = 0
 
+$whitelist = Get-WhitelistedNames
+$parallel = $null
+if ($threads -gt 1 -and $totalFiles -gt 1) {
+    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
+    $parallel = Invoke-ParallelPass -Mode '2' -Label 'Scanning' -Whitelist $whitelist
+}
+
+$idx = 0
 foreach ($jar in $jarFiles) {
+    $i = $idx
     $idx++
+
+    if ($null -ne $parallel) {
+        if (-not $parallel.ContainsKey($i)) { continue }
+        $r = $parallel[$i]
+        $pats = @($r.Patterns)
+        $strs = @($r.Strings)
+        $fws  = @($r.Fullwidth)
+        if ($pats.Count -gt 0 -or $strs.Count -gt 0 -or $fws.Count -gt 0) {
+            $suspiciousMods += [PSCustomObject]@{
+                FileName  = $jar.Name
+                FilePath  = $jar.FullName
+                Patterns  = $pats
+                Strings   = $strs
+                Fullwidth = $fws
+            }
+            $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
+        }
+        continue
+    }
+
     $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
     Write-Host "`r[$spinner] Scanning: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
-
-    $verifiedEntry = $verifiedMods | Where-Object { $_.FileName -eq $jar.Name } | Select-Object -First 1
-    if ($verifiedEntry -and $verifiedEntry.ModrinthWhitelisted -eq $true) {
-        continue
-    }
+    if ($whitelist -and $whitelist.Contains($jar.Name)) { continue }
 
     $result = Invoke-ModScan -FilePath $jar.FullName
 
@@ -1563,18 +1842,38 @@ foreach ($jar in $jarFiles) {
 Write-Host "`r$(' ' * 100)`r" -NoNewline
 
 Write-Host "🛡️  Pass 3 — Bypass/injection scan on all $totalFiles $modWord..." -ForegroundColor Magenta
-$idx = 0
 
+$whitelist = Get-WhitelistedNames
+$parallel = $null
+if ($threads -gt 1 -and $totalFiles -gt 1) {
+    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
+    $parallel = Invoke-ParallelPass -Mode '3' -Label 'Bypass scan' -Whitelist $whitelist
+}
+
+$idx = 0
 foreach ($jar in $jarFiles) {
+    $i = $idx
     $idx++
+
+    if ($null -ne $parallel) {
+        if (-not $parallel.ContainsKey($i)) { continue }
+        $bypassFlags = @($parallel[$i].Flags)
+        if ($bypassFlags.Count -gt 0) {
+            $bypassMods += [PSCustomObject]@{
+                FileName = $jar.Name
+                FilePath = $jar.FullName
+                Flags    = $bypassFlags
+            }
+            $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
+            $unknownMods  = $unknownMods  | Where-Object { $_.FileName -ne $jar.Name }
+        }
+        continue
+    }
+
     $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
     Write-Host "`r[$spinner] Bypass scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
-
-    $verifiedEntry = $verifiedMods | Where-Object { $_.FileName -eq $jar.Name } | Select-Object -First 1
-    if ($verifiedEntry -and $verifiedEntry.ModrinthWhitelisted -eq $true) {
-        continue
-    }
+    if ($whitelist -and $whitelist.Contains($jar.Name)) { continue }
 
     $bypassFlags = Invoke-BypassScan -FilePath $jar.FullName
 
@@ -1592,14 +1891,26 @@ foreach ($jar in $jarFiles) {
 Write-Host "`r$(' ' * 100)`r" -NoNewline
 
 Write-Host "🔎 Pass 4 — Obfuscation analysis on all $totalFiles $modWord..." -ForegroundColor DarkCyan
+
+$parallel = $null
+if ($threads -gt 1 -and $totalFiles -gt 1) {
+    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
+    $parallel = Invoke-ParallelPass -Mode '4' -Label 'Obf scan' -Whitelist $null
+}
+
 $idx = 0
-
 foreach ($jar in $jarFiles) {
+    $i = $idx
     $idx++
-    $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
-    Write-Host "`r[$spinner] Obf scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
-    $obfFlags = Invoke-ObfuscationScan -FilePath $jar.FullName
+    if ($null -ne $parallel) {
+        if (-not $parallel.ContainsKey($i)) { continue }
+        $obfFlags = @($parallel[$i].Flags)
+    } else {
+        $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
+        Write-Host "`r[$spinner] Obf scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
+        $obfFlags = Invoke-ObfuscationScan -FilePath $jar.FullName
+    }
 
     if ($obfFlags.Count -gt 0) {
         $alreadyFlagged = ($suspiciousMods | Where-Object { $_.FileName -eq $jar.Name }).Count -gt 0 -or
