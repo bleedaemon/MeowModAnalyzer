@@ -1711,47 +1711,83 @@ function Invoke-ParallelPass {
     $count = $jarFiles.Count
     if ($count -lt 2 -or $threads -lt 2) { return $null }
 
-    Write-Host "   Using $threads parallel threads (optimized)" -ForegroundColor DarkGray
+    Write-Host "   Using $threads parallel threads (RunspacePool)" -ForegroundColor DarkGray
 
     $results = [System.Collections.Concurrent.ConcurrentDictionary[int, object]]::new()
-    $completedCount = 0
 
-    $jarFiles | ForEach-Object -Parallel {
-        $jar = $_
-        $i = $using:jarFiles.IndexOf($jar)
+    $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $threads, $sessionState, $Host)
+    $runspacePool.Open()
 
-        if ($using:whitelist -and $using:whitelist.Contains($jar.Name)) { return }
+    $jobs = [System.Collections.Generic.List[object]]::new()
 
-        $payload = @{
-            Patterns  = @()
-            Strings   = @()
-            Fullwidth = @()
-            Flags     = @()
+    for ($i = 0; $i -lt $count; $i++) {
+        $jar = $jarFiles[$i]
+        if ($Whitelist -and $Whitelist.Contains($jar.Name)) { continue }
+
+        $scriptBlock = {
+            param($FilePath, $ScanMode, $Pats, $Strs, $Fws, $ChStrs, $BypassCode, $ObfCode, $ModScanCode)
+
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+            $script:patternRegex = [regex]::new($Pats, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+            $script:fullwidthRegex = [regex]::new($Fws, [System.Text.RegularExpressions.RegexOptions]::Compiled)
+            $script:cheatStrings = $ChStrs
+            $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
+
+            . ([scriptblock]::Create($ModScanCode))
+            . ([scriptblock]::Create($BypassCode))
+            . ([scriptblock]::Create($ObfCode))
+
+            $payload = @{ Patterns = @(); Strings = @(); Fullwidth = @(); Flags = @() }
+            try {
+                switch ($ScanMode) {
+                    '2' {
+                        $r = Invoke-ModScan -FilePath $FilePath
+                        $payload.Patterns = @($r.Patterns)
+                        $payload.Strings = @($r.Strings)
+                        $payload.Fullwidth = @($r.Fullwidth)
+                    }
+                    '3' { $payload.Flags = @(Invoke-BypassScan -FilePath $FilePath) }
+                    '4' { $payload.Flags = @(Invoke-ObfuscationScan -FilePath $FilePath) }
+                }
+            } catch { }
+            return [PSCustomObject]$payload
         }
 
+        $powershell = [System.Management.Automation.PowerShell]::Create().AddScript($scriptBlock)
+        [void]$powershell.AddArgument($jar.FullName)
+        [void]$powershell.AddArgument($Mode)
+        [void]$powershell.AddArgument($patternRegex.ToString())
+        [void]$powershell.AddArgument($fullwidthRegex.ToString())
+        [void]$powershell.AddArgument($cheatStrings)
+        [void]$powershell.AddArgument((Get-Command Invoke-BypassScan).Definition)
+        [void]$powershell.AddArgument((Get-Command Invoke-ObfuscationScan).Definition)
+        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
+
+        $powershell.RunspacePool = $runspacePool
+        $jobs.Add([PSCustomObject]@{
+            Index = $i
+            PowerShell = $powershell
+            AsyncResult = $powershell.BeginInvoke()
+        })
+    }
+
+    foreach ($job in $jobs) {
         try {
-            switch ($using:Mode) {
-                '2' {
-                    $r = Invoke-ModScan -FilePath $jar.FullName
-                    $payload.Patterns  = @($r.Patterns)
-                    $payload.Strings   = @($r.Strings)
-                    $payload.Fullwidth = @($r.Fullwidth)
-                }
-                '3' {
-                    $payload.Flags = @(Invoke-BypassScan -FilePath $jar.FullName)
-                }
-                '4' {
-                    $payload.Flags = @(Invoke-ObfuscationScan -FilePath $jar.FullName)
-                }
+            $output = $job.PowerShell.EndInvoke($job.AsyncResult)
+            if ($output) {
+                $results[$job.Index] = $output[0]
             }
         } catch { }
-
-        $using:results[$i] = [PSCustomObject]$payload
-    } -ThrottleLimit $threads
-
-    if ($results.Count -eq 0 -and $Mode -ne '4') {
-        return $null
+        $job.PowerShell.Dispose()
     }
+
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+
+    if ($results.Count -eq 0 -and $Mode -ne '4') { return $null }
 
     $finalResults = @{}
     foreach ($kv in $results.GetEnumerator()) {
