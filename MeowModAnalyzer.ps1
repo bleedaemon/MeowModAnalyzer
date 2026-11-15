@@ -1726,18 +1726,16 @@ function Invoke-ParallelPass {
         if ($Whitelist -and $Whitelist.Contains($jar.Name)) { continue }
 
         $scriptBlock = {
-            param($FilePath, $ScanMode, $Pats, $PatOpts, $Fws, $FwOpts, $ChStrs, $ModScanCode, $BypassCode, $ObfCode)
+            param($FilePath, $ScanMode, $Pats, $PatOpts, $Fws, $FwOpts, $ChStrs, $BypassCode, $ObfCode, $ModScanCode)
 
             Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-            # Восстанавливаем те же самые регулярные выражения и хэш-сеты, что и в основном потоке
             $script:patternRegex   = [regex]::new($Pats, [System.Text.RegularExpressions.RegexOptions]$PatOpts)
             $script:fullwidthRegex = [regex]::new($Fws, [System.Text.RegularExpressions.RegexOptions]$FwOpts)
             $script:cheatStrings   = $ChStrs
             $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
             foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
 
-            # Динамически внедряем оригинальные тела функций в контекст воркера
             . ([scriptblock]::Create($ModScanCode))
             . ([scriptblock]::Create($BypassCode))
             . ([scriptblock]::Create($ObfCode))
@@ -1770,9 +1768,9 @@ function Invoke-ParallelPass {
         [void]$powershell.AddArgument($fullwidthRegex.ToString())
         [void]$powershell.AddArgument([int]$fullwidthRegex.Options)
         [void]$powershell.AddArgument($script:cheatStrings)
-        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
         [void]$powershell.AddArgument((Get-Command Invoke-BypassScan).Definition)
         [void]$powershell.AddArgument((Get-Command Invoke-ObfuscationScan).Definition)
+        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
 
         $powershell.RunspacePool = $runspacePool
         $jobs.Add([PSCustomObject]@{
