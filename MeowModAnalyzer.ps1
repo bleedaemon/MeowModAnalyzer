@@ -1684,17 +1684,19 @@ function Get-ParallelWorkerPayload {
 $script:ParallelWorkerBlock = {
     param($WorkerMode, $WorkerList, $WorkerOut, $Payload)
 
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
     foreach ($name in @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')) {
         if ($Payload.Functions -and $Payload.Functions.ContainsKey($name)) {
             . ([scriptblock]::Create([string]$Payload.Functions[$name]))
         }
     }
 
-    $patternRegex = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
-    $fullwidthRegex = [regex]::new([string]$Payload.Fullwidth, [System.Text.RegularExpressions.RegexOptions]$Payload.FullwidthOptions)
-    $script:cheatStrings = @($Payload.CheatStrings)
-    $cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($s in $script:cheatStrings) { [void]$cheatStringSet.Add($s) }
+    $script:patternRegex = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
+    $script:fullwidthRegex = [regex]::new([string]$Payload.Fullwidth, [System.Text.RegularExpressions.RegexOptions]$Payload.FullwidthOptions)
+    $script:cheatStrings = @($Payload.CheatStrings | ForEach-Object { [string]$_ })
+    $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
 
     Invoke-WorkerItems -WorkerMode $WorkerMode -WorkerList $WorkerList -WorkerOut $WorkerOut
 }
