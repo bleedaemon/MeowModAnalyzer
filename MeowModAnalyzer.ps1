@@ -1708,100 +1708,125 @@ function Invoke-ParallelPass {
         $Whitelist
     )
 
+    if (-not $script:ArchiveTemp) { return $null }
     $count = $jarFiles.Count
     if ($count -lt 2 -or $threads -lt 2) { return $null }
 
-    Write-Host "   Using $threads parallel threads (RunspacePool)" -ForegroundColor DarkGray
+    $workerScriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($workerScriptPath) -or -not (Test-Path -LiteralPath $workerScriptPath)) {
+        $workerScriptPath = Join-Path $script:ArchiveTemp "meow_worker.ps1"
+        try {
+            $myCode = $MyInvocation.MyCommand.ScriptBlock.ToString()
+            if (-not $myCode) { $myCode = Get-Content -LiteralPath $script:MyInvocation.MyCommand.Path -Raw -ErrorAction SilentlyContinue }
+            if ($myCode) { [System.IO.File]::WriteAllText($workerScriptPath, $myCode, [System.Text.Encoding]::UTF8) }
+        } catch { }
+    }
 
-    $results = [System.Collections.Concurrent.ConcurrentDictionary[int, object]]::new()
+    if (-not (Test-Path -LiteralPath $workerScriptPath)) {
+        Write-Host "   ⚠️  Could not create worker script path — falling back to single thread" -ForegroundColor DarkYellow
+        return $null
+    }
 
-    $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $runspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $threads, $sessionState, $Host)
-    $runspacePool.Open()
+    $root = Join-Path $script:ArchiveTemp ("parallel-" + $Mode)
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
 
-    $jobs = [System.Collections.Generic.List[object]]::new()
+    $chunkCount = [Math]::Min($threads, $count)
+    $baseSize = [int][Math]::Floor($count / [double]$chunkCount)
+    $remainder = $count % $chunkCount
 
-    for ($i = 0; $i -lt $count; $i++) {
-        $jar = $jarFiles[$i]
-        if ($Whitelist -and $Whitelist.Contains($jar.Name)) { continue }
+    $jobs = @()
+    $start = 0
+    for ($c = 0; $c -lt $chunkCount; $c++) {
+        $size = $baseSize
+        if ($c -lt $remainder) { $size++ }
+        if ($size -lt 1) { continue }
+        $end = $start + $size
 
-        $scriptBlock = {
-            param($FilePath, $ScanMode, $Pats, $PatOpts, $Fws, $FwOpts, $ChStrs, $BypassCode, $ObfCode, $ModScanCode)
-
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-            $script:patternRegex   = [regex]::new($Pats, [System.Text.RegularExpressions.RegexOptions]$PatOpts)
-            $script:fullwidthRegex = [regex]::new($Fws, [System.Text.RegularExpressions.RegexOptions]$FwOpts)
-            $script:cheatStrings   = $ChStrs
-            $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-            foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
-
-            . ([scriptblock]::Create($ModScanCode))
-            . ([scriptblock]::Create($BypassCode))
-            . ([scriptblock]::Create($ObfCode))
-
-            $payload = @{ Patterns = @(); Strings = @(); Fullwidth = @(); Flags = @() }
-            try {
-                switch ($ScanMode) {
-                    '2' {
-                        $r = Invoke-ModScan -FilePath $FilePath
-                        $payload.Patterns  = @($r.Patterns)
-                        $payload.Strings   = @($r.Strings)
-                        $payload.Fullwidth = @($r.Fullwidth)
-                    }
-                    '3' {
-                        $payload.Flags = @(Invoke-BypassScan -FilePath $FilePath)
-                    }
-                    '4' {
-                        $payload.Flags = @(Invoke-ObfuscationScan -FilePath $FilePath)
-                    }
-                }
-            } catch { }
-            return [PSCustomObject]$payload
+        $chunkItems = @()
+        for ($i = $start; $i -lt $end; $i++) {
+            $jar = $jarFiles[$i]
+            $isWhite = $false
+            if ($Whitelist -and $Whitelist.Contains($jar.Name)) { $isWhite = $true }
+            $chunkItems += [PSCustomObject]@{
+                Index = $i
+                Path  = $jar.FullName
+                White = $isWhite
+            }
         }
 
-        $powershell = [System.Management.Automation.PowerShell]::Create().AddScript($scriptBlock)
-        [void]$powershell.AddArgument($jar.FullName)
-        [void]$powershell.AddArgument($Mode)
-        [void]$powershell.AddArgument($patternRegex.ToString())
-        [void]$powershell.AddArgument([int]$patternRegex.Options)
-        [void]$powershell.AddArgument($fullwidthRegex.ToString())
-        [void]$powershell.AddArgument([int]$fullwidthRegex.Options)
-        [void]$powershell.AddArgument($script:cheatStrings)
-        [void]$powershell.AddArgument((Get-Command Invoke-BypassScan).Definition)
-        [void]$powershell.AddArgument((Get-Command Invoke-ObfuscationScan).Definition)
-        [void]$powershell.AddArgument((Get-Command Invoke-ModScan).Definition)
+        $listPath = Join-Path $root ("chunk-{0}.json" -f $c)
+        $chunkJson = ConvertTo-Json -InputObject @($chunkItems) -Compress -Depth 4
+        [System.IO.File]::WriteAllText($listPath, $chunkJson, [System.Text.UTF8Encoding]::new($false))
 
-        $powershell.RunspacePool = $runspacePool
-        $jobs.Add([PSCustomObject]@{
-            Index       = $i
-            PowerShell  = $powershell
-            AsyncResult = $powershell.BeginInvoke()
-        })
-    }
+        $outDir = Join-Path $root ("out-{0}" -f $c)
+        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-    foreach ($job in $jobs) {
         try {
-            $output = $job.PowerShell.EndInvoke($job.AsyncResult)
-            if ($output) {
-                $results[$job.Index] = $output[0]
+            $job = Start-Job -FilePath $workerScriptPath -ArgumentList $Mode, $listPath, $outDir
+        } catch {
+            foreach ($j in $jobs) {
+                try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
             }
-        } catch { }
-        $job.PowerShell.Dispose()
+            return $null
+        }
+        $jobs += [PSCustomObject]@{ Job = $job; OutDir = $outDir; Start = $start; End = $end }
+        $start = $end
     }
 
-    $runspacePool.Close()
-    $runspacePool.Dispose()
+    if ($jobs.Count -eq 0) { return $null }
 
-    if ($results.Count -eq 0 -and $Mode -ne '4') { return $null }
+    try {
+        while ($true) {
+            $active = @($jobs | Where-Object { @('Completed','Failed','Stopped') -notcontains $_.Job.State })
+            if ($active.Count -eq 0) { break }
 
-    $finalResults = @{}
-    foreach ($kv in $results.GetEnumerator()) {
-        $finalResults[$kv.Key] = $kv.Value
+            $completed = 0
+            for ($c = 0; $c -lt $jobs.Count; $c++) {
+                $j = $jobs[$c]
+                $countFile = Join-Path $j.OutDir "count.txt"
+                if (Test-Path -LiteralPath $countFile) {
+                    try {
+                        $n = 0
+                        if ([int]::TryParse([System.IO.File]::ReadAllText($countFile, [System.Text.Encoding]::UTF8).Trim(), [ref]$n)) {
+                            $completed += $n
+                        }
+                    } catch { }
+                }
+            }
+            $percent = if ($count -gt 0) { [int][Math]::Floor(100.0 * $completed / $count) } else { 0 }
+            if ($percent -gt 100) { $percent = 100 }
+            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" -PercentComplete $percent
+            Start-Sleep -Milliseconds 100
+        }
+    } finally {
+        Write-Progress -Activity "$Label ($threads threads)" -Completed
     }
 
-    Write-Host "   ✓ $Label`: $count/$count mods scanned successfully" -ForegroundColor DarkGray
-    return $finalResults
+    $results = @{}
+    $missing = 0
+    foreach ($j in $jobs) {
+        try { Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null } catch { }
+        try { Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
+        for ($i = $j.Start; $i -lt $j.End; $i++) {
+            $file = Join-Path $j.OutDir ("r{0}.json" -f $i)
+            if (-not (Test-Path -LiteralPath $file)) { $missing++; continue }
+            try {
+                $text = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
+                $results[$i] = $text | ConvertFrom-Json
+            } catch { $missing++ }
+        }
+    }
+
+    if ($missing -gt 0) {
+        Write-Host "   ⚠️  Parallel scan incomplete ($missing result(s) missing) — falling back to single thread" -ForegroundColor DarkYellow
+        return $null
+    }
+
+    Write-Host "   ✓ $Label`: $count/$count mods scanned successfully with $threads threads" -ForegroundColor DarkGray
+    return $results
 }
 
 $modWord = if ($totalFiles -eq 1) { "mod" } else { "mods" }
