@@ -867,7 +867,7 @@ function Invoke-ModScan {
         $archive = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
 
         foreach ($entry in $archive.Entries) {
-            foreach ($m in $patternRegex.Matches($entry.FullName)) {
+            foreach ($m in $script:patternRegex.Matches($entry.FullName)) {
                 [void]$foundPatterns.Add($m.Value)
             }
         }
@@ -902,14 +902,14 @@ function Invoke-ModScan {
                     $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
                     $utf8  = [System.Text.Encoding]::UTF8.GetString($bytes)
 
-                    foreach ($m in $patternRegex.Matches($ascii)) { [void]$foundPatterns.Add($m.Value) }
+                    foreach ($m in $script:patternRegex.Matches($ascii)) { [void]$foundPatterns.Add($m.Value) }
 
-                    foreach ($s in $cheatStringSet) {
+                    foreach ($s in $script:cheatStringSet) {
                         if ($ascii.Contains($s)) { [void]$foundStrings.Add($s); continue }
                         if ($utf8.Contains($s))  { [void]$foundStrings.Add($s) }
                     }
 
-                    foreach ($m in $fullwidthRegex.Matches($utf8)) {
+                    foreach ($m in $script:fullwidthRegex.Matches($utf8)) {
                         [void]$foundFullwidth.Add($m.Value)
                     }
                 } catch { }
@@ -1692,9 +1692,9 @@ $script:ParallelWorkerBlock = {
         }
     }
 
-    $script:patternRegex = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
+    $script:patternRegex   = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
     $script:fullwidthRegex = [regex]::new([string]$Payload.Fullwidth, [System.Text.RegularExpressions.RegexOptions]$Payload.FullwidthOptions)
-    $script:cheatStrings = @($Payload.CheatStrings | ForEach-Object { [string]$_ })
+    $script:cheatStrings   = @($Payload.CheatStrings)
     $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
 
