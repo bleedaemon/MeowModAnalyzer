@@ -1708,143 +1708,58 @@ function Invoke-ParallelPass {
         $Whitelist
     )
 
-    if (-not $script:ArchiveTemp) { return $null }
     $count = $jarFiles.Count
     if ($count -lt 2 -or $threads -lt 2) { return $null }
 
-    $useFileWorker = -not [string]::IsNullOrWhiteSpace($PSCommandPath)
-    $workerPayload = $null
-    if (-not $useFileWorker) {
-        $workerPayload = Get-ParallelWorkerPayload
-        if ($null -eq $workerPayload) {
-            Write-Host "   ⚠️  Could not prepare parallel workers — using a single thread" -ForegroundColor DarkYellow
-            return $null
+    Write-Host "   Using $threads parallel threads (optimized)" -ForegroundColor DarkGray
+
+    $results = [System.Collections.Concurrent.ConcurrentDictionary[int, object]]::new()
+    $completedCount = 0
+
+    $jarFiles | ForEach-Object -Parallel {
+        $jar = $_
+        $i = $using:jarFiles.IndexOf($jar)
+
+        if ($using:whitelist -and $using:whitelist.Contains($jar.Name)) { return }
+
+        $payload = @{
+            Patterns  = @()
+            Strings   = @()
+            Fullwidth = @()
+            Flags     = @()
         }
-    }
-
-    $root = Join-Path $script:ArchiveTemp ("parallel-" + $Mode)
-    if (Test-Path -LiteralPath $root) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
-
-    $chunkCount = [Math]::Min($threads, $count)
-    $baseSize = [int][Math]::Floor($count / [double]$chunkCount)
-    $remainder = $count % $chunkCount
-
-    $jobs = @()
-    $start = 0
-    for ($c = 0; $c -lt $chunkCount; $c++) {
-        $size = $baseSize
-        if ($c -lt $remainder) { $size++ }
-        if ($size -lt 1) { continue }
-        $end = $start + $size
-
-        $chunkItems = @()
-        for ($i = $start; $i -lt $end; $i++) {
-            $jar = $jarFiles[$i]
-            $isWhite = $false
-            if ($Whitelist -and $Whitelist.Contains($jar.Name)) { $isWhite = $true }
-            $chunkItems += [PSCustomObject]@{
-                Index = $i
-                Path  = $jar.FullName
-                White = $isWhite
-            }
-        }
-
-        $listPath = Join-Path $root ("chunk-{0}.json" -f $c)
-        $chunkJson = ConvertTo-Json -InputObject @($chunkItems) -Compress -Depth 4
-        [System.IO.File]::WriteAllText($listPath, $chunkJson, [System.Text.UTF8Encoding]::new($false))
-
-        $outDir = Join-Path $root ("out-{0}" -f $c)
-        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
         try {
-            if ($useFileWorker) {
-                $job = Start-Job -FilePath $PSCommandPath -ArgumentList $Mode, $listPath, $outDir
-            } else {
-                $job = Start-Job -ScriptBlock $script:ParallelWorkerBlock -ArgumentList $Mode, $listPath, $outDir, $workerPayload
-            }
-        } catch {
-            foreach ($j in $jobs) {
-                try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
-            }
-            Write-Host "   ⚠️  Could not start parallel workers — falling back to a single thread" -ForegroundColor DarkYellow
-            return $null
-        }
-        $jobs += [PSCustomObject]@{ Job = $job; OutDir = $outDir; Start = $start; End = $end }
-        $start = $end
-    }
-
-    if ($jobs.Count -eq 0) { return $null }
-
-    try {
-        while ($true) {
-            $active = @($jobs | Where-Object { @('Completed','Failed','Stopped') -notcontains $_.Job.State })
-            if ($active.Count -eq 0) { break }
-
-            $completed = 0
-            $ops = @()
-            for ($c = 0; $c -lt $jobs.Count; $c++) {
-                $j = $jobs[$c]
-
-                $countFile = Join-Path $j.OutDir "count.txt"
-                if (Test-Path -LiteralPath $countFile) {
-                    try {
-                        $n = 0
-                        if ([int]::TryParse([System.IO.File]::ReadAllText($countFile, [System.Text.Encoding]::UTF8).Trim(), [ref]$n)) {
-                            $completed += $n
-                        }
-                    } catch { }
+            switch ($using:Mode) {
+                '2' {
+                    $r = Invoke-ModScan -FilePath $jar.FullName
+                    $payload.Patterns  = @($r.Patterns)
+                    $payload.Strings   = @($r.Strings)
+                    $payload.Fullwidth = @($r.Fullwidth)
                 }
-
-                $statusFile = Join-Path $j.OutDir "status.txt"
-                $current = ""
-                if (Test-Path -LiteralPath $statusFile) {
-                    try { $current = [System.IO.File]::ReadAllText($statusFile, [System.Text.Encoding]::UTF8).Trim() } catch { }
+                '3' {
+                    $payload.Flags = @(Invoke-BypassScan -FilePath $jar.FullName)
                 }
-                if ($current -eq "done") { $current = "✓ finished" }
-                elseif ([string]::IsNullOrWhiteSpace($current)) { $current = "starting…" }
-                else { $current = "scanning $current" }
-                $ops += ("T{0}: {1}" -f ($c + 1), $current)
+                '4' {
+                    $payload.Flags = @(Invoke-ObfuscationScan -FilePath $jar.FullName)
+                }
             }
+        } catch { }
 
-            $percent = 0
-            if ($count -gt 0) {
-                $percent = [int][Math]::Floor(100.0 * $completed / $count)
-                if ($percent -gt 100) { $percent = 100 }
-            }
-            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" `
-                -PercentComplete $percent -CurrentOperation ($ops -join "  |  ")
-            Start-Sleep -Milliseconds 150
-        }
-    } finally {
-        Write-Progress -Activity "$Label ($threads threads)" -Completed
-    }
+        $using:results[$i] = [PSCustomObject]$payload
+    } -ThrottleLimit $threads
 
-    $results = @{}
-    $missing = 0
-    foreach ($j in $jobs) {
-        try { Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null } catch { }
-        try { Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
-        for ($i = $j.Start; $i -lt $j.End; $i++) {
-            $file = Join-Path $j.OutDir ("r{0}.json" -f $i)
-            if (-not (Test-Path -LiteralPath $file)) { $missing++; continue }
-            try {
-                $text = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
-                $results[$i] = $text | ConvertFrom-Json
-            } catch { $missing++ }
-        }
-    }
-
-    if ($missing -gt 0) {
-        Write-Host "   ⚠️  Parallel scan incomplete ($missing result(s) missing) — falling back to a single thread" -ForegroundColor DarkYellow
+    if ($results.Count -eq 0 -and $Mode -ne '4') {
         return $null
     }
 
-    $threadWord = if ($threads -eq 1) { "thread" } else { "threads" }
-    Write-Host "   ✓ $Label`: $count/$count mods scanned with $threads $threadWord" -ForegroundColor DarkGray
-    return $results
+    $finalResults = @{}
+    foreach ($kv in $results.GetEnumerator()) {
+        $finalResults[$kv.Key] = $kv.Value
+    }
+
+    Write-Host "   ✓ $Label`: $count/$count mods scanned successfully" -ForegroundColor DarkGray
+    return $finalResults
 }
 
 $modWord = if ($totalFiles -eq 1) { "mod" } else { "mods" }
