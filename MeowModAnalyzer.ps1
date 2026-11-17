@@ -806,7 +806,13 @@ function Get-FileSHA1 {
 
 function Get-DownloadSource {
     param([string]$Path)
-    $zoneData = Get-Content -Raw -Stream Zone.Identifier $Path -ErrorAction SilentlyContinue
+    # -Raw is not valid together with -Stream in Windows PowerShell 5.1.
+    # Read the alternate data stream line by line and join it instead.
+    $zoneData = ''
+    try {
+        $zoneLines = @(Get-Content -LiteralPath $Path -Stream Zone.Identifier -ErrorAction Stop)
+        $zoneData  = $zoneLines -join "`n"
+    } catch { $zoneData = '' }
     if ($zoneData -match "HostUrl=(.+)") {
         $url = $matches[1].Trim()
         if ($url -match "mediafire\.com")                                        { return "MediaFire" }
@@ -833,9 +839,9 @@ function Get-DownloadSource {
 function Query-Modrinth {
     param([string]$Hash)
     try {
-        $versionInfo = Invoke-RestMethod -Uri "https://api.modrinth.com/v2/version_file/$Hash" -Method Get -UseBasicParsing -ErrorAction Stop
+        $versionInfo = Invoke-RestMethod -Uri "https://api.modrinth.com/v2/version_file/$Hash" -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         if ($versionInfo.project_id) {
-            $projectInfo = Invoke-RestMethod -Uri "https://api.modrinth.com/v2/project/$($versionInfo.project_id)" -Method Get -UseBasicParsing -ErrorAction Stop
+            $projectInfo = Invoke-RestMethod -Uri "https://api.modrinth.com/v2/project/$($versionInfo.project_id)" -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             return @{ Name = $projectInfo.title; Slug = $projectInfo.slug }
         }
     } catch { }
@@ -845,7 +851,7 @@ function Query-Modrinth {
 function Query-Megabase {
     param([string]$Hash)
     try {
-        $result = Invoke-RestMethod -Uri "https://megabase.vercel.app/api/query?hash=$Hash" -Method Get -UseBasicParsing -ErrorAction Stop
+        $result = Invoke-RestMethod -Uri "https://megabase.vercel.app/api/query?hash=$Hash" -Method Get -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         if (-not $result.error) { return $result.data }
     } catch { }
     return $null
@@ -1326,7 +1332,12 @@ function Invoke-WorkerItems {
     try {
         if ($WorkerList -and (Test-Path -LiteralPath $WorkerList)) {
             $listText = [System.IO.File]::ReadAllText($WorkerList, [System.Text.Encoding]::UTF8)
-            $items = @($listText | ConvertFrom-Json)
+            # Windows PowerShell 5.1 emits a JSON array as one pipeline object;
+            # assigning first and then enumerating avoids an extra nested array.
+            $parsed = $listText | ConvertFrom-Json
+            if ($null -ne $parsed) {
+                foreach ($p in $parsed) { $items += $p }
+            }
         }
     } catch { }
 
@@ -1660,9 +1671,9 @@ function Get-WhitelistedNames {
     return ,$set
 }
 
-# When this script was launched through Invoke-Expression / Invoke-RestMethod there
-# is no $PSCommandPath to re-execute for Start-Job -FilePath. In that case the
-# worker is built from the functions and lookup tables already loaded in memory.
+# The worker is always built from the functions and lookup tables already loaded
+# in memory: with Invoke-Expression / Invoke-RestMethod there is no $PSCommandPath
+# to re-execute, and even with a file this avoids depending on its location.
 function Get-ParallelWorkerPayload {
     $names = @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')
     $defs = @{}
@@ -1712,18 +1723,13 @@ function Invoke-ParallelPass {
     $count = $jarFiles.Count
     if ($count -lt 2 -or $threads -lt 2) { return $null }
 
-    $workerScriptPath = $PSCommandPath
-    if ([string]::IsNullOrWhiteSpace($workerScriptPath) -or -not (Test-Path -LiteralPath $workerScriptPath)) {
-        $workerScriptPath = Join-Path $script:ArchiveTemp "meow_worker.ps1"
-        try {
-            $myCode = $MyInvocation.MyCommand.ScriptBlock.ToString()
-            if (-not $myCode) { $myCode = Get-Content -LiteralPath $script:MyInvocation.MyCommand.Path -Raw -ErrorAction SilentlyContinue }
-            if ($myCode) { [System.IO.File]::WriteAllText($workerScriptPath, $myCode, [System.Text.Encoding]::UTF8) }
-        } catch { }
-    }
-
-    if (-not (Test-Path -LiteralPath $workerScriptPath)) {
-        Write-Host "   ⚠️  Could not create worker script path — falling back to single thread" -ForegroundColor DarkYellow
+    # Never try to re-execute "this file": with Invoke-Expression / Invoke-RestMethod
+    # $PSCommandPath is empty and $MyInvocation only sees this function, so a
+    # re-created worker script would be just the function body. Serialize the
+    # already-loaded scan functions and lookup tables into the job instead.
+    $workerPayload = Get-ParallelWorkerPayload
+    if ($null -eq $workerPayload) {
+        Write-Host "   ⚠️  Could not prepare parallel workers — using a single thread" -ForegroundColor DarkYellow
         return $null
     }
 
@@ -1765,11 +1771,12 @@ function Invoke-ParallelPass {
         New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
         try {
-            $job = Start-Job -FilePath $workerScriptPath -ArgumentList $Mode, $listPath, $outDir
+            $job = Start-Job -ScriptBlock $script:ParallelWorkerBlock -ArgumentList $Mode, $listPath, $outDir, $workerPayload
         } catch {
             foreach ($j in $jobs) {
                 try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
             }
+            Write-Host "   ⚠️  Could not start parallel workers — using a single thread" -ForegroundColor DarkYellow
             return $null
         }
         $jobs += [PSCustomObject]@{ Job = $job; OutDir = $outDir; Start = $start; End = $end }
@@ -1784,6 +1791,7 @@ function Invoke-ParallelPass {
             if ($active.Count -eq 0) { break }
 
             $completed = 0
+            $ops = @()
             for ($c = 0; $c -lt $jobs.Count; $c++) {
                 $j = $jobs[$c]
                 $countFile = Join-Path $j.OutDir "count.txt"
@@ -1795,11 +1803,25 @@ function Invoke-ParallelPass {
                         }
                     } catch { }
                 }
+
+                $statusFile = Join-Path $j.OutDir "status.txt"
+                $current = ""
+                if (Test-Path -LiteralPath $statusFile) {
+                    try { $current = [System.IO.File]::ReadAllText($statusFile, [System.Text.Encoding]::UTF8).Trim() } catch { }
+                }
+                if ($current -eq "done") { $current = "✓ finished" }
+                elseif ([string]::IsNullOrWhiteSpace($current)) { $current = "starting…" }
+                else { $current = "scanning $current" }
+                $ops += ("T{0}: {1}" -f ($c + 1), $current)
             }
-            $percent = if ($count -gt 0) { [int][Math]::Floor(100.0 * $completed / $count) } else { 0 }
-            if ($percent -gt 100) { $percent = 100 }
-            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" -PercentComplete $percent
-            Start-Sleep -Milliseconds 100
+            $percent = 0
+            if ($count -gt 0) {
+                $percent = [int][Math]::Floor(100.0 * $completed / $count)
+                if ($percent -gt 100) { $percent = 100 }
+            }
+            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" `
+                -PercentComplete $percent -CurrentOperation ($ops -join "  |  ")
+            Start-Sleep -Milliseconds 150
         }
     } finally {
         Write-Progress -Activity "$Label ($threads threads)" -Completed
@@ -1807,8 +1829,9 @@ function Invoke-ParallelPass {
 
     $results = @{}
     $missing = 0
+    $jobErrors = @()
     foreach ($j in $jobs) {
-        try { Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null } catch { }
+        try { $jobErrors += @(Receive-Job -Job $j.Job -ErrorAction SilentlyContinue 2>&1) } catch { }
         try { Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
         for ($i = $j.Start; $i -lt $j.End; $i++) {
             $file = Join-Path $j.OutDir ("r{0}.json" -f $i)
@@ -1822,10 +1845,15 @@ function Invoke-ParallelPass {
 
     if ($missing -gt 0) {
         Write-Host "   ⚠️  Parallel scan incomplete ($missing result(s) missing) — falling back to single thread" -ForegroundColor DarkYellow
+        $firstError = @($jobErrors | Where-Object { $_ } | Select-Object -First 1)
+        if ($firstError.Count -gt 0) {
+            Write-Host "      worker error: $($firstError[0])" -ForegroundColor DarkGray
+        }
         return $null
     }
 
-    Write-Host "   ✓ $Label`: $count/$count mods scanned successfully with $threads threads" -ForegroundColor DarkGray
+    $threadWord = if ($threads -eq 1) { "thread" } else { "threads" }
+    Write-Host "   ✓ $Label`: $count/$count mods scanned with $threads $threadWord" -ForegroundColor DarkGray
     return $results
 }
 
