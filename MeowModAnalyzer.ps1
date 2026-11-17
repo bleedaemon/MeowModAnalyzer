@@ -1,15 +1,6 @@
-param(
-    [string]$WorkerMode = '',
-    [string]$WorkerList = '',
-    [string]$WorkerOut  = ''
-)
-
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
-try { [Console]::InputEncoding  = [System.Text.Encoding]::UTF8 } catch { }
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
-
-# Workers run this same file with -WorkerMode; skip all of the interactive UI.
-if (-not $WorkerMode) {
 chcp 65001 | Out-Null
 Clear-Host
 
@@ -51,422 +42,31 @@ Write-Host "MeowTonynoh" -ForegroundColor Cyan
 Write-Host ""
 Write-Host ("━" * 76) -ForegroundColor DarkCyan
 Write-Host
-}
 
-# ---------------------------------------------------------------------------
-# Scan-scope helpers
-# ---------------------------------------------------------------------------
-$script:SkipDirNames = @(
-    '.git','.svn','.hg','node_modules','__pycache__','.cache','.gradle','.m2','loom-cache',
-    'proc','sys','dev','run','usr','lib','lib32','lib64','bin','sbin','etc','boot','var','nix','snap',
-    'libraries','versions','runtime','jre','jdk','processedMods','assets','natives',
-    'System Volume Information','Windows','Program Files','Program Files (x86)',
-    'ProgramData','Windows.old','Recovery','PerfLogs'
-)
-
-$script:ArchiveTemp = $null
-if (-not $WorkerMode) {
-    $script:ArchiveTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("meowmodanalyzer-archives-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Force -Path $script:ArchiveTemp | Out-Null
-}
-$script:JarOrigin = @{}
-$script:HashPrimary = @{}
-$script:PathDupes = @{}
-$script:DuplicateJars = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$script:DuplicateCount = 0
-
-function Remove-ArchiveTemp {
-    if ($script:ArchiveTemp -and (Test-Path -LiteralPath $script:ArchiveTemp)) {
-        Remove-Item -LiteralPath $script:ArchiveTemp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Get-NormPath {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
-    try { return [System.IO.Path]::GetFullPath($Path).TrimEnd('\','/') }
-    catch { return $Path.TrimEnd('\','/') }
-}
-
-function Test-IsSystemDir {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $p = Get-NormPath $Path
-    $homeDir = ''
-    if ($env:USERPROFILE) { $homeDir = Get-NormPath $env:USERPROFILE }
-    elseif ($env:HOME)   { $homeDir = Get-NormPath $env:HOME }
-    if ($homeDir -and $p -ieq $homeDir) { return $true }
-    if ($p -eq '' -or $p -eq '/' -or $p -match '^[A-Za-z]:$') { return $true }
-
-    $roots = @()
-    foreach ($v in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData,
-                     '/bin','/sbin','/usr','/usr/bin','/usr/sbin','/usr/local','/usr/lib','/lib','/lib64',
-                     '/etc','/var','/opt','/boot','/run','/proc','/sys','/dev','/snap','/nix',
-                     '/System','/Library','/Applications','/private')) {
-        if ($v) {
-            $n = Get-NormPath $v
-            if ($n) { $roots += $n }
-        }
-    }
-    $sep = [System.IO.Path]::DirectorySeparatorChar
-    foreach ($r in $roots) {
-        if ($p -ieq $r) { return $true }
-        if ($p.StartsWith($r + $sep, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-    }
-    return $false
-}
-
-function Get-DefaultMinecraftMods {
-    if ($env:APPDATA) { return (Join-Path $env:APPDATA '.minecraft\mods') }
-    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
-    if ($homeDir) { return (Join-Path (Join-Path $homeDir '.minecraft') 'mods') }
-    return '.minecraft\mods'
-}
-
-function Get-DefaultCustomPath {
-    $pwdPath = (Get-Location).Path
-    if ($pwdPath -and -not (Test-IsSystemDir $pwdPath)) { return $pwdPath }
-    return (Get-DefaultMinecraftMods)
-}
-
-function Test-SkipJarPath {
-    param([string]$Path)
-    $p = $Path -replace '/','\'
-    $lp = $p.ToLowerInvariant()
-    if ($lp -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
-    if ($lp -match '\\(libraries|versions|runtime|jre|jdk|\.gradle|\.m2|loom-cache)\\') { return $true }
-
-    $name = [System.IO.Path]::GetFileName($p).ToLowerInvariant()
-    foreach ($pat in @('minecraft*.jar','forge-*.jar','neoforge-*.jar','fabric-loader*.jar','quilt-loader*.jar',
-                       'authlib*.jar','brigadier*.jar','datafixerupper*.jar','log4j*.jar','netty*.jar','guava*.jar',
-                       'gson*.jar','asm-*.jar','jopt-simple*.jar','commons-*.jar','slf4j*.jar','lwjgl*.jar',
-                       'jna*.jar','joml*.jar','oshi*.jar','text2speech*.jar',
-                       'gradle-wrapper*.jar','remapped.*.jar','remapped-*.jar')) {
-        if ($name -like $pat) { return $true }
-    }
-    return $false
-}
-
-function Add-JarFile {
-    param([string]$Path, [string]$Origin)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
-    if (Test-SkipJarPath $Path) { return }
-    try { $full = (Resolve-Path -LiteralPath $Path).Path } catch { return }
-    if (-not $script:JarSeen.Add($full)) { return }
-    if ($Origin) { $script:JarOrigin[$full] = $Origin }
-    [void]$script:JarFiles.Add([PSCustomObject]@{
-        FullName = $full
-        Name     = [System.IO.Path]::GetFileName($full)
-    })
-}
-
-function Get-FullDisplay {
-    param([string]$Path, [string]$Name)
-    if ($Path -and $script:JarOrigin.ContainsKey($Path)) {
-        return ("{0} → {1}" -f $script:JarOrigin[$Path], $Name)
-    }
-    if ($Path) { return $Path }
-    return $Name
-}
-
-function Get-ModDisplay {
-    param([string]$Path, [string]$Name)
-    if ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers') {
-        return (Get-FullDisplay -Path $Path -Name $Name)
-    }
-    return $Name
-}
-
-function Get-ExtraPaths {
-    param([string]$Path)
-    if (-not $Path) { return @() }
-    if ($script:PathDupes.ContainsKey($Path)) { return $script:PathDupes[$Path] }
-    return @()
-}
-
-function Get-FullDisplayForPath {
-    param([string]$Path)
-    if (-not $Path) { return '' }
-    return (Get-FullDisplay -Path $Path -Name ([System.IO.Path]::GetFileName($Path)))
-}
-
-function Write-ExtraPaths {
-    param(
-        [string]$Path,
-        [string]$Prefix = '  │    ',
-        [ConsoleColor]$Color = 'DarkGray'
-    )
-    foreach ($extra in (Get-ExtraPaths -Path $Path)) {
-        Write-Host ($Prefix + "↳ ") -ForegroundColor $Color -NoNewline
-        Write-Host (Get-FullDisplayForPath -Path $extra) -ForegroundColor $Color
-    }
-}
-
-function Get-ModsDirJars {
-    param([string]$Dir)
-    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
-    Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -ieq '.jar' } |
-        ForEach-Object { Add-JarFile $_.FullName }
-}
-
-function Get-LauncherModDirs {
-    $dirs  = New-Object System.Collections.ArrayList
-    $bases = New-Object System.Collections.ArrayList
-    $lunar = New-Object System.Collections.ArrayList
-
-    [void]$dirs.Add((Get-DefaultMinecraftMods))
-
-    if ($env:APPDATA) {
-        [void]$bases.Add((Join-Path $env:APPDATA 'PrismLauncher\instances'))
-    }
-    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
-    if ($homeDir) {
-        [void]$bases.Add((Join-Path $homeDir '.local/share/PrismLauncher/instances'))
-        [void]$bases.Add((Join-Path $homeDir '.var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances'))
-        [void]$bases.Add((Join-Path $homeDir 'Library/Application Support/PrismLauncher/instances'))
-        [void]$lunar.Add((Join-Path $homeDir '.lunarclient'))
-        [void]$lunar.Add((Join-Path $homeDir 'Library/Application Support/lunarclient'))
-    }
-
-    foreach ($base in $bases) {
-        if (-not (Test-Path -LiteralPath $base -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            [void]$dirs.Add((Join-Path (Join-Path $_.FullName 'minecraft') 'mods'))
-            [void]$dirs.Add((Join-Path (Join-Path $_.FullName '.minecraft') 'mods'))
-        }
-    }
-
-    foreach ($root in $lunar) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ieq 'mods' } |
-            ForEach-Object { [void]$dirs.Add($_.FullName) }
-    }
-
-    return ($dirs | Select-Object -Unique)
-}
-
-function Get-SystemRoots {
-    $roots = New-Object System.Collections.ArrayList
-    try {
-        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
-            if ($drive.DriveType -eq [System.IO.DriveType]::Fixed -and $drive.IsReady) {
-                [void]$roots.Add($drive.RootDirectory.FullName)
-            }
-        }
-    } catch { }
-    if ($roots.Count -eq 0) {
-        if ($env:SystemDrive) { [void]$roots.Add($env:SystemDrive + '\') }
-        else { [void]$roots.Add('/') }
-    }
-    return $roots
-}
-
-function Test-SkipArchiveEntry {
-    param([string]$Entry)
-    $e = ($Entry -replace '/','\').ToLowerInvariant()
-    if ($e -match '(^|\\)(libraries|versions|runtime|jre|jdk|loom-cache)(\\|$)') { return $true }
-    if ($e -match '(^|\\)\.fabric\\processedmods(\\|$)') { return $true }
-    return $false
-}
-
-function Expand-ArchiveJars {
-    param([string]$Archive, [int]$Index)
-
-    $dest = Join-Path $script:ArchiveTemp ("a{0}" -f $Index)
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-    $fileName = [System.IO.Path]::GetFileName($Archive).ToLowerInvariant()
-    $ext      = [System.IO.Path]::GetExtension($Archive).ToLowerInvariant()
-
-    if ($ext -eq '.zip' -or $ext -eq '.mcpack') {
-        try {
-            $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
-            try {
-                foreach ($entry in $zip.Entries) {
-                    if ($entry.FullName -notmatch '(?i)\.jar$') { continue }
-                    if (Test-SkipArchiveEntry $entry.FullName) { continue }
-                    $base = [System.IO.Path]::GetFileName($entry.FullName)
-                    if (-not $base) { continue }
-                    try {
-                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $dest $base), $true)
-                    } catch { }
-                }
-            } finally { $zip.Dispose() }
-        } catch { }
-    }
-    elseif ($fileName -like '*.tar.gz' -or $fileName -like '*.tgz' -or $ext -eq '.tar') {
-        $tar = Get-Command tar -ErrorAction SilentlyContinue
-        if ($tar) {
-            & $tar.Source -xf $Archive -C $dest '*.jar' '*.JAR' 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                & $tar.Source -xf $Archive -C $dest '*.jar' 2>$null | Out-Null
-            }
-        }
-    }
-    elseif ($ext -eq '.rar' -or $ext -eq '.7z') {
-        $seven = Get-Command 7z -ErrorAction SilentlyContinue
-        if (-not $seven) { $seven = Get-Command 7za -ErrorAction SilentlyContinue }
-        if ($seven) {
-            & $seven.Source x -y ("-o{0}" -f $dest) $Archive '*.jar' 2>$null | Out-Null
-        }
-        elseif ($ext -eq '.rar') {
-            $unrar = Get-Command unrar -ErrorAction SilentlyContinue
-            if ($unrar) {
-                & $unrar.Source x -o+ -inul $Archive '*.jar' ($dest + [System.IO.Path]::DirectorySeparatorChar) 2>$null | Out-Null
-            } else {
-                $bsdtar = Get-Command bsdtar -ErrorAction SilentlyContinue
-                if ($bsdtar) { & $bsdtar.Source -xf $Archive -C $dest '*.jar' 2>$null | Out-Null }
-            }
-        }
-    }
-
-    Get-ChildItem -LiteralPath $dest -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -ieq '.jar' } |
-        ForEach-Object { Add-JarFile -Path $_.FullName -Origin $Archive }
-}
-
-function Add-SystemJars {
-    $archives = New-Object System.Collections.ArrayList
-    $systemPaths = @('/System','/private','/Applications','/cores','/tmp')
-
-    foreach ($root in (Get-SystemRoots)) {
-        Write-Host "   searching: $root" -ForegroundColor Gray
-        $stack = New-Object System.Collections.Stack
-        $stack.Push($root)
-
-        while ($stack.Count -gt 0) {
-            $dir = [string]$stack.Pop()
-
-            try {
-                foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
-                    $ext  = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
-                    $name = [System.IO.Path]::GetFileName($file).ToLowerInvariant()
-                    if ($ext -eq '.jar') {
-                        Add-JarFile $file
-                    }
-                    elseif ($ext -eq '.zip' -or $ext -eq '.mcpack' -or $ext -eq '.rar' -or
-                            $ext -eq '.7z' -or $ext -eq '.tar' -or $ext -eq '.tgz' -or
-                            $name -like '*.tar.gz') {
-                        [void]$archives.Add($file)
-                    }
-                }
-            } catch { }
-
-            try {
-                foreach ($sub in [System.IO.Directory]::EnumerateDirectories($dir)) {
-                    $subName = [System.IO.Path]::GetFileName($sub)
-                    if ($script:SkipDirNames -contains $subName) { continue }
-                    if ($systemPaths -contains $sub) { continue }
-                    if ($sub -ieq $script:ArchiveTemp) { continue }
-                    try {
-                        if (([System.IO.File]::GetAttributes($sub) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                    } catch { continue }
-                    [void]$stack.Push($sub)
-                }
-            } catch { }
-        }
-    }
-
-    Write-Host "   archives found: $($archives.Count)" -ForegroundColor Gray
-    $i = 0
-    foreach ($archive in $archives) {
-        $i++
-        Expand-ArchiveJars -Archive $archive -Index $i
-    }
-}
-
-if (-not $WorkerMode) {
-Write-Host "Select scan scope:" -ForegroundColor White
-Write-Host "  1) " -ForegroundColor Cyan -NoNewline
-Write-Host "Whole system (jars + .zip/.tar.gz/.rar/.mcpack archives + recycle bin)" -ForegroundColor DarkGray
-Write-Host "  2) " -ForegroundColor Cyan -NoNewline
-Write-Host "Launchers only (PrismLauncher + Lunar + .minecraft)" -ForegroundColor DarkGray
-$defPath = Get-DefaultCustomPath
-Write-Host "  3) " -ForegroundColor Cyan -NoNewline
-Write-Host "Custom folder " -ForegroundColor DarkGray -NoNewline
-Write-Host "(default: $defPath)" -ForegroundColor DarkGray
-Write-Host "Choice " -ForegroundColor DarkGray -NoNewline
-Write-Host "[3]" -ForegroundColor DarkGray -NoNewline
-Write-Host ": " -NoNewline
-$scanChoice = Read-Host
-if ([string]::IsNullOrWhiteSpace($scanChoice)) { $scanChoice = '3' }
-while (@('1','2','3') -notcontains $scanChoice) {
-    Write-Host "Please enter 1, 2 or 3: " -ForegroundColor Yellow -NoNewline
-    $scanChoice = Read-Host
-    if ([string]::IsNullOrWhiteSpace($scanChoice)) { $scanChoice = '3' }
-}
+Write-Host "Enter path to the mods folder: " -NoNewline
+Write-Host "(press Enter to use default)" -ForegroundColor DarkGray
+$modsPath = Read-Host "PATH"
 Write-Host
 
-$modsPath = $null
-switch ($scanChoice) {
-    '1' { $scanMode = 'system' }
-    '2' { $scanMode = 'launchers' }
-    '3' {
-        $scanMode = 'custom'
-        Write-Host "Enter path to the mods folder: " -NoNewline
-        Write-Host "(press Enter to use default)" -ForegroundColor DarkGray
-        Write-Host "PATH [$defPath]: " -NoNewline
-        $modsPath = Read-Host
-        Write-Host
-        if (-not [string]::IsNullOrWhiteSpace($modsPath)) {
-            $modsPath = $modsPath.Trim().Trim([char[]]@('"', "'"))
-        }
-        if ([string]::IsNullOrWhiteSpace($modsPath)) {
-            $modsPath = $defPath
-            Write-Host "Continuing with " -NoNewline
-            Write-Host $modsPath -ForegroundColor White
-            Write-Host
-        }
-        if (-not (Test-Path -LiteralPath $modsPath -PathType Container)) {
-            Write-Host "❌ Invalid Path!" -ForegroundColor Red
-            Write-Host "The directory does not exist or is not accessible." -ForegroundColor Yellow
-            Write-Host
-            Write-Host "Tried to access: $modsPath" -ForegroundColor Gray
-            Write-Host
-            Write-Host "Press any key to exit..." -ForegroundColor Gray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            exit 1
-        }
-    }
+if ([string]::IsNullOrWhiteSpace($modsPath)) {
+    $modsPath = "$env:USERPROFILE\AppData\Roaming\.minecraft\mods"
+    Write-Host "Continuing with " -NoNewline
+    Write-Host $modsPath -ForegroundColor White
+    Write-Host
 }
 
-switch ($scanMode) {
-    'system'    {
-        Write-Host "📁 Scan scope: whole system (recycle bin included)" -ForegroundColor Green
-        Write-Host "⚠️  Whole-system scans can take a long time (archive extraction + network lookups)." -ForegroundColor Yellow
-        Write-Host
-        $scanWhere = 'the whole system'
-    }
-    'launchers' {
-        Write-Host "📁 Scan scope: PrismLauncher / Lunar / .minecraft" -ForegroundColor Green
-        $scanWhere = 'the launcher mod folders'
-    }
-    'custom'    {
-        Write-Host "📁 Scanning directory: $modsPath" -ForegroundColor Green
-        $scanWhere = $modsPath
-    }
+if (-not (Test-Path $modsPath -PathType Container)) {
+    Write-Host "❌ Invalid Path!" -ForegroundColor Red
+    Write-Host "The directory does not exist or is not accessible." -ForegroundColor Yellow
+    Write-Host
+    Write-Host "Tried to access: $modsPath" -ForegroundColor Gray
+    Write-Host
+    Write-Host "Press any key to exit..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
 }
-Write-Host
 
-# ---------------------------------------------------------------------------
-# Scan threads
-# ---------------------------------------------------------------------------
-$defaultThreads = if ($scanMode -eq 'custom') { 1 } else { 4 }
-$threads = $defaultThreads
-while ($true) {
-    Write-Host "Threads for scanning" -ForegroundColor DarkGray -NoNewline
-    Write-Host "(1-64) [$defaultThreads]: " -ForegroundColor DarkGray -NoNewline
-    $threadInput = Read-Host
-    if ([string]::IsNullOrWhiteSpace($threadInput)) { break }
-    $parsedThreads = 0
-    if ([int]::TryParse($threadInput.Trim(), [ref]$parsedThreads) -and $parsedThreads -ge 1 -and $parsedThreads -le 64) {
-        $threads = $parsedThreads
-        break
-    }
-    Write-Host "Please enter a number between 1 and 64." -ForegroundColor Yellow
-}
+Write-Host "📁 Scanning directory: $modsPath" -ForegroundColor Green
 Write-Host
 
 $mcProcess = Get-Process javaw -ErrorAction SilentlyContinue
@@ -484,7 +84,6 @@ if ($mcProcess) {
         Write-Host ""
     } catch { }
 }
-}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -495,17 +94,17 @@ $suspiciousPatterns = @(
     "ShieldBreaker", "TriggerBot", "AxeSpam", "WebMacro",
     "FastPlace", "WalskyOptimizer", "WalksyOptimizer", "walsky.optimizer",
     "WalksyCrystalOptimizerMod", "Donut", "Replace Mod",
-    "ShieldDisabler", "SilentAim", "Totem Hit", "Wtap", "FakeLag", "dev.virel", "orchard",
+    "ShieldDisabler", "SilentAim", "Totem Hit", "Wtap", "FakeLag", "dev.virel", "orchard" 
     "BlockESP", "dev.krypton", "dev/krypton", "skid.krypton", "skid/krypton",  "AntiMissClick",
     "LagReach", "PopSwitch", "SprintReset", "ChestSteal", "AntiBot",
     "ElytraSwap", "FastXP", "FastExp", "Refill",  "AirAnchor",
     "jnativehook", "FakeInv", "HoverTotem", "AutoClicker", "AutoFirework",
-    "PackSpoof", "Antiknockback", "catlean",
+    "PackSpoof", "Antiknockback", "catlean", 
     "AuthBypass", "Asteria", "Prestige", "AutoEat", "AutoMine",
     "MaceSwap",  "Macro198", "StunSlam", "SafeAnchor", "DoubleAnchor", "AutoTPA", "BaseFinder", "Xenon", "gypsy",
     "AutoPotRefill", "WalksyOptimizer", "KeyPearl", "AimAssist", "AutoNethPot", "AutoDtap",
     "TriggerBot", "AutoWeb", "AnchorAction",
-
+    
     "org.chainlibs.module.impl.modules.Crystal.Y",
     "org.chainlibs.module.impl.modules.Crystal.bF",
     "org.chainlibs.module.impl.modules.Crystal.bM",
@@ -532,12 +131,12 @@ $suspiciousPatterns = @(
 
 $cheatStrings = @(
     "AutoCrystal", "autocrystal", "auto crystal", "cw crystal", "JDWP.VirtualMachine.AllModules",
-    "dontPlaceCrystal", "dontBreakCrystal", "dev.virel", "orchard",
+    "dontPlaceCrystal", "dontBreakCrystal", "dev.virel", "orchard" 
     "AutoHitCrystal", "autohitcrystal", "canPlaceCrystalServer", "healPotSlot",
     "ＡｕｔｏＣｒｙｓｔａｌ", "Ａｕｔｏ Ｃｒｙｓｔａｌ",
     "ＡｕｔｏＨｉｔＣｒｙｓｔａｌ",
     "AutoAnchor", "autoanchor", "auto anchor", "DoubleAnchor",
-    "HasAnchor", "anchortweaks", "anchor macro", "safe anchor", "safeanchor",
+     "HasAnchor", "anchortweaks", "anchor macro", "safe anchor", "safeanchor",
     "SafeAnchor", "AirAnchor",
     "ＡｕｔｏＡｎｃｈｏｒ", "Ａｕｔｏ Ａｎｃｈｏｒ",
     "ＤｏｕｂｌｅＡｎｃｈｏｒ", "Ｄｏｕｂｌｅ Ａｎｃｈｏｒ",
@@ -569,7 +168,7 @@ $cheatStrings = @(
     "Ｓｐｅａｒ Ｓｗａｐ", "Ａｕｔｏｍａｔｉｃａｌｌｙ ａｘｅ ａｎｄ ｍａｃｅ ｓｈｉｅｌｄｅｄ ｐｌａｙｅｒｓ",
     "Ｓｔｕｎ Ｓｌａｍ", "StunSlam",
     "Donut", "JumpReset", "axespam", "axe spam",
-
+    
     "findKnockbackSword", "attackRegisteredThisClick",
     "AimAssist", "aimassist", "aim assist",
     "triggerbot", "trigger bot",
@@ -867,7 +466,7 @@ function Invoke-ModScan {
         $archive = [System.IO.Compression.ZipFile]::OpenRead($FilePath)
 
         foreach ($entry in $archive.Entries) {
-            foreach ($m in $script:patternRegex.Matches($entry.FullName)) {
+            foreach ($m in $patternRegex.Matches($entry.FullName)) {
                 [void]$foundPatterns.Add($m.Value)
             }
         }
@@ -902,14 +501,14 @@ function Invoke-ModScan {
                     $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
                     $utf8  = [System.Text.Encoding]::UTF8.GetString($bytes)
 
-                    foreach ($m in $script:patternRegex.Matches($ascii)) { [void]$foundPatterns.Add($m.Value) }
+                    foreach ($m in $patternRegex.Matches($ascii)) { [void]$foundPatterns.Add($m.Value) }
 
-                    foreach ($s in $script:cheatStringSet) {
+                    foreach ($s in $cheatStringSet) {
                         if ($ascii.Contains($s)) { [void]$foundStrings.Add($s); continue }
                         if ($utf8.Contains($s))  { [void]$foundStrings.Add($s) }
                     }
 
-                    foreach ($m in $script:fullwidthRegex.Matches($utf8)) {
+                    foreach ($m in $fullwidthRegex.Matches($utf8)) {
                         [void]$foundFullwidth.Add($m.Value)
                     }
                 } catch { }
@@ -1303,90 +902,6 @@ function Invoke-JvmScan {
     return $results
 }
 
-# ---------------------------------------------------------------------------
-# Worker mode (passes 2-4 run inside Start-Job child processes)
-# ---------------------------------------------------------------------------
-function Write-WorkerStatus {
-    param([string]$Path, [string]$Text)
-    try {
-        $tmp = "$Path.tmp"
-        [System.IO.File]::WriteAllText($tmp, $Text, [System.Text.UTF8Encoding]::new($false))
-        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction SilentlyContinue
-    } catch { }
-}
-
-function Invoke-WorkerItems {
-    param(
-        [string]$WorkerMode,
-        [string]$WorkerList,
-        [string]$WorkerOut
-    )
-
-    $items = @()
-    try {
-        if ($WorkerList -and (Test-Path -LiteralPath $WorkerList)) {
-            $listText = [System.IO.File]::ReadAllText($WorkerList, [System.Text.Encoding]::UTF8)
-            $items = @($listText | ConvertFrom-Json)
-        }
-    } catch { }
-
-    $statusFile = Join-Path $WorkerOut "status.txt"
-    $countFile  = Join-Path $WorkerOut "count.txt"
-    $completed  = 0
-
-    foreach ($item in $items) {
-        $idx  = [int]$item.Index
-        $path = [string]$item.Path
-        $outFile = Join-Path $WorkerOut ("r{0}.json" -f $idx)
-
-        Write-WorkerStatus $statusFile ([System.IO.Path]::GetFileName($path))
-
-        $payload = @{
-            Index     = $idx
-            Patterns  = @()
-            Strings   = @()
-            Fullwidth = @()
-            Flags     = @()
-        }
-
-        try {
-            switch ($WorkerMode) {
-                '2' {
-                    if (-not ($item.White -eq $true)) {
-                        $r = Invoke-ModScan -FilePath $path
-                        $payload.Patterns  = @($r.Patterns)
-                        $payload.Strings   = @($r.Strings)
-                        $payload.Fullwidth = @($r.Fullwidth)
-                    }
-                }
-                '3' {
-                    if (-not ($item.White -eq $true)) {
-                        $payload.Flags = @(Invoke-BypassScan -FilePath $path)
-                    }
-                }
-                '4' {
-                    $payload.Flags = @(Invoke-ObfuscationScan -FilePath $path)
-                }
-            }
-        } catch { }
-
-        try {
-            $json = $payload | ConvertTo-Json -Compress -Depth 6
-            [System.IO.File]::WriteAllText($outFile, $json, [System.Text.UTF8Encoding]::new($false))
-        } catch { }
-
-        $completed++
-        Write-WorkerStatus $countFile ([string]$completed)
-    }
-
-    Write-WorkerStatus $statusFile "done"
-}
-
-if ($WorkerMode) {
-    Invoke-WorkerItems -WorkerMode $WorkerMode -WorkerList $WorkerList -WorkerOut $WorkerOut
-    exit 0
-}
-
 function Write-Rule {
     param([string]$Char = "─", [int]$Width = 76, [ConsoleColor]$Color = "DarkGray")
     Write-Host ($Char * $Width) -ForegroundColor $Color
@@ -1414,8 +929,7 @@ function Write-SuspiciousCard {
     Write-Host "  │ " -ForegroundColor DarkRed -NoNewline
     Write-Host " FLAGGED " -ForegroundColor White -BackgroundColor DarkRed -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
-    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
+    Write-Host $Mod.FileName -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkRed
 
     if ($Mod.Patterns.Count -gt 0) {
@@ -1461,8 +975,7 @@ function Write-InjectionCard {
     Write-Host "  │ " -ForegroundColor DarkMagenta -NoNewline
     Write-Host " INJECTION " -ForegroundColor White -BackgroundColor DarkMagenta -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
-    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
+    Write-Host $Mod.FileName -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkMagenta
 
     foreach ($flag in $Mod.Flags) {
@@ -1497,8 +1010,7 @@ function Write-ObfuscationCard {
     Write-Host "  │ " -ForegroundColor DarkYellow -NoNewline
     Write-Host " OBFUSCATED " -ForegroundColor Black -BackgroundColor DarkYellow -NoNewline
     Write-Host "  " -NoNewline
-    Write-Host (Get-ModDisplay -Path $Mod.FilePath -Name $Mod.FileName) -ForegroundColor Yellow
-    Write-ExtraPaths -Path $Mod.FilePath -Prefix '  │    ' -Color DarkGray
+    Write-Host $Mod.FileName -ForegroundColor Yellow
     Write-Host ("  │ " + ("─" * 66)) -ForegroundColor DarkYellow
 
     foreach ($flag in $Mod.Flags) {
@@ -1532,44 +1044,17 @@ $suspiciousMods  = @()
 $bypassMods      = @()
 $obfuscatedMods  = @()
 
-$script:JarFiles = New-Object System.Collections.ArrayList
-$script:JarSeen  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
 try {
-    switch ($scanMode) {
-        'system' {
-            Add-SystemJars
-        }
-        'launchers' {
-            $foundDirs = 0
-            foreach ($d in (Get-LauncherModDirs)) {
-                if (Test-Path -LiteralPath $d -PathType Container) {
-                    Write-Host "   • $d" -ForegroundColor Gray
-                    Get-ModsDirJars $d
-                    $foundDirs++
-                }
-            }
-            if ($foundDirs -eq 0) {
-                Write-Host "   (no launcher mod folders found)" -ForegroundColor Yellow
-            }
-        }
-        'custom' {
-            Get-ModsDirJars $modsPath
-        }
-    }
+    $jarFiles = Get-ChildItem -Path $modsPath -Filter *.jar -ErrorAction Stop
 } catch {
     Write-Host "❌ Error accessing directory: $_" -ForegroundColor Red
-    Remove-ArchiveTemp
     Write-Host "Press any key to exit..." -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
-$jarFiles = @($script:JarFiles)
-
 if ($jarFiles.Count -eq 0) {
-    Write-Host "⚠️  No JAR files found in: $scanWhere" -ForegroundColor Yellow
-    Remove-ArchiveTemp
+    Write-Host "⚠️  No JAR files found in: $modsPath" -ForegroundColor Yellow
     Write-Host "Press any key to exit..." -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 0
@@ -1591,23 +1076,6 @@ foreach ($jar in $jarFiles) {
     Write-Host "`r[$spinner] Verifying: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
     $hash = Get-FileSHA1 -Path $jar.FullName
-
-    if ($hash -and ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers')) {
-        if ($script:HashPrimary.ContainsKey($hash)) {
-            $primary = $script:HashPrimary[$hash]
-            if ($primary -ne $jar.FullName) {
-                if (-not $script:PathDupes.ContainsKey($primary)) {
-                    $script:PathDupes[$primary] = New-Object System.Collections.Generic.List[string]
-                }
-                [void]$script:PathDupes[$primary].Add($jar.FullName)
-                [void]$script:DuplicateJars.Add($jar.FullName)
-                $script:DuplicateCount++
-                continue
-            }
-        } else {
-            $script:HashPrimary[$hash] = $jar.FullName
-        }
-    }
 
     if ($hash) {
         $modrinthData = Query-Modrinth -Hash $hash
@@ -1642,238 +1110,26 @@ foreach ($jar in $jarFiles) {
 
 Write-Host "`r$(' ' * 100)`r" -NoNewline
 
-if ($script:DuplicateJars.Count -gt 0) {
-    $jarFiles = @($jarFiles | Where-Object { -not $script:DuplicateJars.Contains($_.FullName) })
-    $totalFiles = $jarFiles.Count
-    $dupWord = if ($script:DuplicateCount -eq 1) { 'duplicate' } else { 'duplicates' }
-    Write-Host "   ↺ Merged $($script:DuplicateCount) $dupWord with identical SHA-1" -ForegroundColor DarkGray
-}
-
-# ---------------------------------------------------------------------------
-# Parallel scan support (passes 2-4)
-# ---------------------------------------------------------------------------
-function Get-WhitelistedNames {
-    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($m in $verifiedMods) {
-        if ($m.ModrinthWhitelisted -eq $true) { [void]$set.Add($m.FileName) }
-    }
-    return ,$set
-}
-
-# When this script was launched through Invoke-Expression / Invoke-RestMethod there
-# is no $PSCommandPath to re-execute for Start-Job -FilePath. In that case the
-# worker is built from the functions and lookup tables already loaded in memory.
-function Get-ParallelWorkerPayload {
-    $names = @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')
-    $defs = @{}
-    foreach ($name in $names) {
-        $cmd = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
-        if (-not $cmd) { return $null }
-        $defs[$name] = "function $name {`n$($cmd.Definition)`n}"
-    }
-    return @{
-        Functions        = $defs
-        Patterns         = $patternRegex.ToString()
-        PatternOptions   = [int]$patternRegex.Options
-        Fullwidth        = $fullwidthRegex.ToString()
-        FullwidthOptions = [int]$fullwidthRegex.Options
-        CheatStrings     = @($script:cheatStrings)
-    }
-}
-
-$script:ParallelWorkerBlock = {
-    param($WorkerMode, $WorkerList, $WorkerOut, $Payload)
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-    foreach ($name in @('Invoke-ModScan', 'Invoke-ObfuscationScan', 'Invoke-BypassScan', 'Write-WorkerStatus', 'Invoke-WorkerItems')) {
-        if ($Payload.Functions -and $Payload.Functions.ContainsKey($name)) {
-            . ([scriptblock]::Create([string]$Payload.Functions[$name]))
-        }
-    }
-
-    $script:patternRegex   = [regex]::new([string]$Payload.Patterns, [System.Text.RegularExpressions.RegexOptions]$Payload.PatternOptions)
-    $script:fullwidthRegex = [regex]::new([string]$Payload.Fullwidth, [System.Text.RegularExpressions.RegexOptions]$Payload.FullwidthOptions)
-    $script:cheatStrings   = @($Payload.CheatStrings)
-    $script:cheatStringSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($s in $script:cheatStrings) { [void]$script:cheatStringSet.Add($s) }
-
-    Invoke-WorkerItems -WorkerMode $WorkerMode -WorkerList $WorkerList -WorkerOut $WorkerOut
-}
-
-function Invoke-ParallelPass {
-    param(
-        [string]$Mode,
-        [string]$Label,
-        $Whitelist
-    )
-
-    if (-not $script:ArchiveTemp) { return $null }
-    $count = $jarFiles.Count
-    if ($count -lt 2 -or $threads -lt 2) { return $null }
-
-    $workerScriptPath = $PSCommandPath
-    if ([string]::IsNullOrWhiteSpace($workerScriptPath) -or -not (Test-Path -LiteralPath $workerScriptPath)) {
-        $workerScriptPath = Join-Path $script:ArchiveTemp "meow_worker.ps1"
-        try {
-            $myCode = $MyInvocation.MyCommand.ScriptBlock.ToString()
-            if (-not $myCode) { $myCode = Get-Content -LiteralPath $script:MyInvocation.MyCommand.Path -Raw -ErrorAction SilentlyContinue }
-            if ($myCode) { [System.IO.File]::WriteAllText($workerScriptPath, $myCode, [System.Text.Encoding]::UTF8) }
-        } catch { }
-    }
-
-    if (-not (Test-Path -LiteralPath $workerScriptPath)) {
-        Write-Host "   ⚠️  Could not create worker script path — falling back to single thread" -ForegroundColor DarkYellow
-        return $null
-    }
-
-    $root = Join-Path $script:ArchiveTemp ("parallel-" + $Mode)
-    if (Test-Path -LiteralPath $root) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
-
-    $chunkCount = [Math]::Min($threads, $count)
-    $baseSize = [int][Math]::Floor($count / [double]$chunkCount)
-    $remainder = $count % $chunkCount
-
-    $jobs = @()
-    $start = 0
-    for ($c = 0; $c -lt $chunkCount; $c++) {
-        $size = $baseSize
-        if ($c -lt $remainder) { $size++ }
-        if ($size -lt 1) { continue }
-        $end = $start + $size
-
-        $chunkItems = @()
-        for ($i = $start; $i -lt $end; $i++) {
-            $jar = $jarFiles[$i]
-            $isWhite = $false
-            if ($Whitelist -and $Whitelist.Contains($jar.Name)) { $isWhite = $true }
-            $chunkItems += [PSCustomObject]@{
-                Index = $i
-                Path  = $jar.FullName
-                White = $isWhite
-            }
-        }
-
-        $listPath = Join-Path $root ("chunk-{0}.json" -f $c)
-        $chunkJson = ConvertTo-Json -InputObject @($chunkItems) -Compress -Depth 4
-        [System.IO.File]::WriteAllText($listPath, $chunkJson, [System.Text.UTF8Encoding]::new($false))
-
-        $outDir = Join-Path $root ("out-{0}" -f $c)
-        New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
-        try {
-            $job = Start-Job -FilePath $workerScriptPath -ArgumentList $Mode, $listPath, $outDir
-        } catch {
-            foreach ($j in $jobs) {
-                try { Stop-Job -Job $j.Job -ErrorAction SilentlyContinue; Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
-            }
-            return $null
-        }
-        $jobs += [PSCustomObject]@{ Job = $job; OutDir = $outDir; Start = $start; End = $end }
-        $start = $end
-    }
-
-    if ($jobs.Count -eq 0) { return $null }
-
-    try {
-        while ($true) {
-            $active = @($jobs | Where-Object { @('Completed','Failed','Stopped') -notcontains $_.Job.State })
-            if ($active.Count -eq 0) { break }
-
-            $completed = 0
-            for ($c = 0; $c -lt $jobs.Count; $c++) {
-                $j = $jobs[$c]
-                $countFile = Join-Path $j.OutDir "count.txt"
-                if (Test-Path -LiteralPath $countFile) {
-                    try {
-                        $n = 0
-                        if ([int]::TryParse([System.IO.File]::ReadAllText($countFile, [System.Text.Encoding]::UTF8).Trim(), [ref]$n)) {
-                            $completed += $n
-                        }
-                    } catch { }
-                }
-            }
-            $percent = if ($count -gt 0) { [int][Math]::Floor(100.0 * $completed / $count) } else { 0 }
-            if ($percent -gt 100) { $percent = 100 }
-            Write-Progress -Activity "$Label ($threads threads)" -Status "$completed/$count mods scanned" -PercentComplete $percent
-            Start-Sleep -Milliseconds 100
-        }
-    } finally {
-        Write-Progress -Activity "$Label ($threads threads)" -Completed
-    }
-
-    $results = @{}
-    $missing = 0
-    foreach ($j in $jobs) {
-        try { Receive-Job -Job $j.Job -ErrorAction SilentlyContinue | Out-Null } catch { }
-        try { Remove-Job -Job $j.Job -Force -ErrorAction SilentlyContinue } catch { }
-        for ($i = $j.Start; $i -lt $j.End; $i++) {
-            $file = Join-Path $j.OutDir ("r{0}.json" -f $i)
-            if (-not (Test-Path -LiteralPath $file)) { $missing++; continue }
-            try {
-                $text = [System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8)
-                $results[$i] = $text | ConvertFrom-Json
-            } catch { $missing++ }
-        }
-    }
-
-    if ($missing -gt 0) {
-        Write-Host "   ⚠️  Parallel scan incomplete ($missing result(s) missing) — falling back to single thread" -ForegroundColor DarkYellow
-        return $null
-    }
-
-    Write-Host "   ✓ $Label`: $count/$count mods scanned successfully with $threads threads" -ForegroundColor DarkGray
-    return $results
-}
-
 $modWord = if ($totalFiles -eq 1) { "mod" } else { "mods" }
 Write-Host "🔬 Pass 2 — Deep-scanning all $totalFiles $modWord..." -ForegroundColor Cyan
-
-$whitelist = Get-WhitelistedNames
-$parallel = $null
-if ($threads -gt 1 -and $totalFiles -gt 1) {
-    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
-    $parallel = Invoke-ParallelPass -Mode '2' -Label 'Scanning' -Whitelist $whitelist
-}
-
 $idx = 0
+
 foreach ($jar in $jarFiles) {
-    $i = $idx
     $idx++
-
-    if ($null -ne $parallel) {
-        if (-not $parallel.ContainsKey($i)) { continue }
-        $r = $parallel[$i]
-        $pats = @($r.Patterns)
-        $strs = @($r.Strings)
-        $fws  = @($r.Fullwidth)
-        if ($pats.Count -gt 0 -or $strs.Count -gt 0 -or $fws.Count -gt 0) {
-            $suspiciousMods += [PSCustomObject]@{
-                FileName  = $jar.Name
-                FilePath  = $jar.FullName
-                Patterns  = $pats
-                Strings   = $strs
-                Fullwidth = $fws
-            }
-            $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
-        }
-        continue
-    }
-
     $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
     Write-Host "`r[$spinner] Scanning: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
-    if ($whitelist -and $whitelist.Contains($jar.Name)) { continue }
+
+    $verifiedEntry = $verifiedMods | Where-Object { $_.FileName -eq $jar.Name } | Select-Object -First 1
+    if ($verifiedEntry -and $verifiedEntry.ModrinthWhitelisted -eq $true) {
+        continue
+    }
 
     $result = Invoke-ModScan -FilePath $jar.FullName
 
     if ($result.Patterns.Count -gt 0 -or $result.Strings.Count -gt 0 -or $result.Fullwidth.Count -gt 0) {
         $suspiciousMods += [PSCustomObject]@{
             FileName = $jar.Name
-            FilePath = $jar.FullName
             Patterns = $result.Patterns
             Strings  = $result.Strings
             Fullwidth = $result.Fullwidth
@@ -1885,45 +1141,24 @@ foreach ($jar in $jarFiles) {
 Write-Host "`r$(' ' * 100)`r" -NoNewline
 
 Write-Host "🛡️  Pass 3 — Bypass/injection scan on all $totalFiles $modWord..." -ForegroundColor Magenta
-
-$whitelist = Get-WhitelistedNames
-$parallel = $null
-if ($threads -gt 1 -and $totalFiles -gt 1) {
-    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
-    $parallel = Invoke-ParallelPass -Mode '3' -Label 'Bypass scan' -Whitelist $whitelist
-}
-
 $idx = 0
+
 foreach ($jar in $jarFiles) {
-    $i = $idx
     $idx++
-
-    if ($null -ne $parallel) {
-        if (-not $parallel.ContainsKey($i)) { continue }
-        $bypassFlags = @($parallel[$i].Flags)
-        if ($bypassFlags.Count -gt 0) {
-            $bypassMods += [PSCustomObject]@{
-                FileName = $jar.Name
-                FilePath = $jar.FullName
-                Flags    = $bypassFlags
-            }
-            $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
-            $unknownMods  = $unknownMods  | Where-Object { $_.FileName -ne $jar.Name }
-        }
-        continue
-    }
-
     $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
     Write-Host "`r[$spinner] Bypass scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
 
-    if ($whitelist -and $whitelist.Contains($jar.Name)) { continue }
+
+    $verifiedEntry = $verifiedMods | Where-Object { $_.FileName -eq $jar.Name } | Select-Object -First 1
+    if ($verifiedEntry -and $verifiedEntry.ModrinthWhitelisted -eq $true) {
+        continue
+    }
 
     $bypassFlags = Invoke-BypassScan -FilePath $jar.FullName
 
     if ($bypassFlags.Count -gt 0) {
         $bypassMods += [PSCustomObject]@{
             FileName = $jar.Name
-            FilePath = $jar.FullName
             Flags    = $bypassFlags
         }
         $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
@@ -1934,26 +1169,14 @@ foreach ($jar in $jarFiles) {
 Write-Host "`r$(' ' * 100)`r" -NoNewline
 
 Write-Host "🔎 Pass 4 — Obfuscation analysis on all $totalFiles $modWord..." -ForegroundColor DarkCyan
-
-$parallel = $null
-if ($threads -gt 1 -and $totalFiles -gt 1) {
-    Write-Host "   Using $threads threads" -ForegroundColor DarkGray
-    $parallel = Invoke-ParallelPass -Mode '4' -Label 'Obf scan' -Whitelist $null
-}
-
 $idx = 0
-foreach ($jar in $jarFiles) {
-    $i = $idx
-    $idx++
 
-    if ($null -ne $parallel) {
-        if (-not $parallel.ContainsKey($i)) { continue }
-        $obfFlags = @($parallel[$i].Flags)
-    } else {
-        $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
-        Write-Host "`r[$spinner] Obf scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
-        $obfFlags = Invoke-ObfuscationScan -FilePath $jar.FullName
-    }
+foreach ($jar in $jarFiles) {
+    $idx++
+    $spinner = $spinnerFrames[$idx % $spinnerFrames.Length]
+    Write-Host "`r[$spinner] Obf scan: $idx/$totalFiles - $($jar.Name)" -ForegroundColor Yellow -NoNewline
+
+    $obfFlags = Invoke-ObfuscationScan -FilePath $jar.FullName
 
     if ($obfFlags.Count -gt 0) {
         $alreadyFlagged = ($suspiciousMods | Where-Object { $_.FileName -eq $jar.Name }).Count -gt 0 -or
@@ -1961,7 +1184,6 @@ foreach ($jar in $jarFiles) {
         if (-not $alreadyFlagged) {
             $obfuscatedMods += [PSCustomObject]@{
                 FileName = $jar.Name
-                FilePath = $jar.FullName
                 Flags    = $obfFlags
             }
             $verifiedMods = $verifiedMods | Where-Object { $_.FileName -ne $jar.Name }
@@ -1989,8 +1211,7 @@ if ($verifiedMods.Count -gt 0) {
         Write-Host "  ✓ " -ForegroundColor Green -NoNewline
         Write-Host "$($mod.ModName)" -ForegroundColor White -NoNewline
         Write-Host " → " -ForegroundColor Gray -NoNewline
-        Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
-        Write-ExtraPaths -Path $mod.FilePath -Prefix '               ' -Color DarkGray
+        Write-Host "$($mod.FileName)" -ForegroundColor DarkGray
     }
     Write-Host ""
 }
@@ -2006,11 +1227,6 @@ if ($unknownMods.Count -gt 0) {
         $bottomLine = "  ╚═ " + $sourceText + " " + ("═" * (67 - $sourceText.Length)) + "╝"
         Write-Host $topLine    -ForegroundColor Yellow
         Write-Host $bottomLine -ForegroundColor Yellow
-        if ($script:scanMode -eq 'system' -or $script:scanMode -eq 'launchers') {
-            Write-Host "  ↳ " -ForegroundColor DarkGray -NoNewline
-            Write-Host (Get-ModDisplay -Path $mod.FilePath -Name $mod.FileName) -ForegroundColor DarkGray
-            Write-ExtraPaths -Path $mod.FilePath -Prefix '  ' -Color DarkGray
-        }
         Write-Host ""
     }
 }
@@ -2077,122 +1293,6 @@ if ($jvmFlags.Count -gt 0) {
     Write-Host ""
 }
 
-function Add-ResultExtraLines {
-    param($Lines, [string]$Path)
-    foreach ($extra in (Get-ExtraPaths -Path $Path)) {
-        $null = $Lines.Add("  ↳ " + (Get-FullDisplayForPath -Path $extra))
-    }
-}
-
-function Write-ResultsFile {
-    $lines = [System.Collections.Generic.List[string]]::new()
-    $null = $lines.Add('Meow Mod Analyzer — Results')
-    $null = $lines.Add("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    $null = $lines.Add("Scan scope: $script:scanMode")
-    $null = $lines.Add("Scanned: $scanWhere")
-    $null = $lines.Add('')
-    $null = $lines.Add('SUMMARY')
-    $null = $lines.Add('-------')
-    $null = $lines.Add("Total files scanned: $totalFiles")
-    if ($script:DuplicateJars.Count -gt 0) {
-        $null = $lines.Add("Duplicates merged:   $($script:DuplicateCount)")
-    }
-    $null = $lines.Add("Verified mods:       $($verifiedMods.Count)")
-    $null = $lines.Add("Unknown mods:        $($unknownMods.Count)")
-    $null = $lines.Add("Suspicious mods:     $($suspiciousMods.Count)")
-    $null = $lines.Add("Bypass/Injected:     $($bypassMods.Count)")
-    $null = $lines.Add("Obfuscated mods:     $($obfuscatedMods.Count)")
-    $null = $lines.Add("JVM issues:          $($jvmFlags.Count)")
-
-    if ($verifiedMods.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('VERIFIED MODS')
-        $null = $lines.Add('-------------')
-        foreach ($mod in $verifiedMods) {
-            $null = $lines.Add(("✓ {0} → {1}" -f $mod.ModName, (Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)))
-            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
-        }
-    }
-
-    if ($unknownMods.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('UNKNOWN MODS')
-        $null = $lines.Add('------------')
-        foreach ($mod in $unknownMods) {
-            $null = $lines.Add("? $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
-            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
-            $src = if ($mod.DownloadSource) { $mod.DownloadSource } else { '?' }
-            $null = $lines.Add("  Source: $src")
-        }
-    }
-
-    if ($suspiciousMods.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('SUSPICIOUS MODS')
-        $null = $lines.Add('---------------')
-        foreach ($mod in $suspiciousMods) {
-            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
-            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
-            if ($mod.Patterns.Count -gt 0) {
-                $null = $lines.Add('  Patterns:')
-                foreach ($p in ($mod.Patterns | Sort-Object)) { $null = $lines.Add("    $p") }
-            }
-            $uniqueStrings = $mod.Strings | Where-Object { $mod.Patterns -notcontains $_ } | Sort-Object
-            if ($uniqueStrings.Count -gt 0) {
-                $null = $lines.Add('  Strings:')
-                foreach ($s in $uniqueStrings) { $null = $lines.Add("    $s") }
-            }
-            if ($mod.Fullwidth -and $mod.Fullwidth.Count -gt 0) {
-                $null = $lines.Add('  Fullwidth Unicode:')
-                foreach ($fw in ($mod.Fullwidth | Sort-Object)) { $null = $lines.Add("    $fw") }
-            }
-        }
-    }
-
-    if ($bypassMods.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('BYPASS / INJECTION DETECTED')
-        $null = $lines.Add('---------------------------')
-        foreach ($mod in $bypassMods) {
-            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
-            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
-            foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
-        }
-    }
-
-    if ($obfuscatedMods.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('OBFUSCATED MODS')
-        $null = $lines.Add('---------------')
-        foreach ($mod in $obfuscatedMods) {
-            $null = $lines.Add("! $(Get-FullDisplay -Path $mod.FilePath -Name $mod.FileName)")
-            Add-ResultExtraLines -Lines $lines -Path $mod.FilePath
-            foreach ($flag in $mod.Flags) { $null = $lines.Add("    $flag") }
-        }
-    }
-
-    if ($jvmFlags.Count -gt 0) {
-        $null = $lines.Add('')
-        $null = $lines.Add('JVM / RUNTIME INJECTION')
-        $null = $lines.Add('-----------------------')
-        foreach ($flag in $jvmFlags) { $null = $lines.Add("◉ $flag") }
-    }
-
-    $resultsDir  = if ($env:SystemDrive) { $env:SystemDrive + '\ss' } else { 'C:\ss' }
-    $resultsFile = Join-Path $resultsDir 'MeowModResults.txt'
-
-    try {
-        if (-not (Test-Path -LiteralPath $resultsDir -PathType Container)) {
-            New-Item -ItemType Directory -Force -Path $resultsDir -ErrorAction Stop | Out-Null
-        }
-        [System.IO.File]::WriteAllLines($resultsFile, $lines)
-        Write-Host "📝 Results saved to: $resultsFile" -ForegroundColor DarkGray
-    } catch {
-        Write-Host "⚠️  Could not write results file: $resultsFile" -ForegroundColor Yellow
-    }
-    Write-Host ""
-}
-
 Write-Host "📊 SUMMARY" -ForegroundColor Cyan
 Write-Rule "━" 76 Blue
 Write-Host "  Total files scanned: " -ForegroundColor Gray -NoNewline; Write-Host "$totalFiles"                   -ForegroundColor White
@@ -2205,7 +1305,6 @@ Write-Host "  JVM issues:          " -ForegroundColor Gray -NoNewline; Write-Hos
 Write-Host
 Write-Rule "━" 76 Blue
 Write-Host ""
-Write-ResultsFile
 Write-Host "  ✨ Analysis complete! Thanks for using Meow Mod Analyzer 🐱" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  👤 Created by: " -ForegroundColor White -NoNewline
@@ -2227,5 +1326,4 @@ Write-Host ""
 Write-Rule "━" 76 Blue
 Write-Host ""
 Write-Host "Press any key to exit..." -ForegroundColor DarkGray
-Remove-ArchiveTemp
 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
